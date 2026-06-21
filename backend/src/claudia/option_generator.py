@@ -11,6 +11,14 @@ _SYSTEM = (
 )
 
 
+def _strip_code_fence(content: str) -> str:
+    # glm-5.2 occasionally fences its JSON in ```json ... ``` despite json_object mode.
+    text = content.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0]
+    return text.strip()
+
+
 def _user_prompt(context, persona, history, n, lang) -> str:
     lines = [f"Language: {lang}", f"Her persona: {persona.profile}"]
     if persona.reading_level:
@@ -30,5 +38,5 @@ async def generate(context, persona, history, n, lang) -> list[Candidate]:
     ]
     content = await openrouter.chat(
         messages, model=config.MODEL_LLM, response_format={"type": "json_object"})
-    options = json.loads(content)["options"]
+    options = json.loads(_strip_code_fence(content))["options"]
     return [Candidate(text=o["text"], glosses=o["glosses"]) for o in options][:n]
