@@ -227,6 +227,7 @@ CREATE TABLE settings (
   value TEXT NOT NULL                    -- lang='nl', option_count='5',
                                          -- match_threshold='0.30',
                                          -- vad_silence_ms='800',
+                                         -- echo_guard_ms='300',
                                          -- asr_model='nvidia/parakeet-tdt-0.6b-v3'
 );
 ```
@@ -249,7 +250,9 @@ otherwise an internal service.
 
 ### `WS /expressive/listen` — listen and propose (the centerpiece)
 
-- **Client → server:** binary audio frames (16 kHz mono PCM16, ~20 ms each).
+- **Client → server:** binary audio frames (16 kHz mono PCM16, ~20 ms each),
+  plus small JSON control markers `{ type: 'mute' }` / `{ type: 'unmute' }` that
+  bracket TTS playback (see §11) so the segmenter ignores audio while she speaks.
 - **Per connection, the server:** feeds frames to `AudioSegmenter`; on a silence
   endpoint it takes the buffered utterance audio → `Transcriber.transcribe` →
   if the transcript is non-empty, load persona + recent picks →
@@ -309,7 +312,8 @@ otherwise an internal service.
 7. The backend pushes `{ transcript, options }` over the WS; the browser shows N
    rows of large symbol cards.
 8. She selects one via `SelectionInput` → `POST /expressive/select` records the
-   pick and returns the final text; the browser speaks it in the active language.
+   pick and returns the final text; the browser speaks it in the active language,
+   gating the mic while it speaks so the reply is not re-heard (§11).
 9. The pick is logged and feeds the next turn's persona context.
 
 **Internal translation** (used inside step 6, and exposed via `/translate` for
@@ -358,6 +362,14 @@ Run once, and again whenever the vocabulary changes. Not in the live path.
   Acceptable for a prototype.
 - **WebSocket drop:** the browser reconnects; any in-flight utterance is
   discarded. No partial options are shown.
+- **TTS echo / feedback loop:** her spoken reply (browser `SpeechSynthesis`)
+  must not be heard by the mic and re-transcribed as a new utterance. The client
+  **gates the mic while speaking** — it stops streaming frames from
+  `SpeechSynthesis` `onstart` until `onend` plus a short guard tail
+  (`settings.echo_guard_ms`, ~300 ms) — and enables `echoCancellation` on
+  `getUserMedia` as defense in depth. It brackets playback with `mute` / `unmute`
+  WS markers (see §7) so the backend discards any utterance spanning that window.
+  Net: while she speaks, the system does not listen.
 - **Low-confidence match:** if a gloss's best symbol is below
   `settings.match_threshold`, the card shows the gloss **as text** instead of a
   wrong picture, and is flagged for curation. Never show a confidently-wrong
@@ -401,9 +413,10 @@ Run once, and again whenever the vocabulary changes. Not in the live path.
   enrichment). One OpenRouter client serves ASR, LLM, and embeddings.
 - Front-end: plain HTML/CSS/JS — a grid of large targets, dwell-to-select,
   browser `SpeechSynthesis` for speech, and `getUserMedia` + an `AudioWorklet`
-  to capture the mic, downsample to 16 kHz mono PCM16, and stream frames over the
-  WebSocket. (Browser `SpeechRecognition` is no longer used; transcription is on
-  the backend.)
+  to capture the mic (with `echoCancellation` enabled), downsample to 16 kHz mono
+  PCM16, and stream frames over the WebSocket. The client gates the mic during
+  `SpeechSynthesis` playback to avoid an echo loop (§11). (Browser
+  `SpeechRecognition` is no longer used; transcription is on the backend.)
 
 ## 14. Open questions and future work
 
