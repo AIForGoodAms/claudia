@@ -774,7 +774,7 @@ describe("DwellSelector", () => {
     const onSelect = vi.fn();
     const sel = new DwellSelector({ dwellMs: 500, onSelect, now: () => t });
     sel.enter("opt-1"); t = 300; sel.leave();
-    sel.enter("opt-2"); t = 700; sel.tick();
+    sel.enter("opt-2"); t = 800; sel.tick();
     expect(onSelect).toHaveBeenCalledWith("opt-2");
   });
 });
