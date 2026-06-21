@@ -135,6 +135,8 @@ async def listen(ws: WebSocket):
     try:
         while True:
             message = await ws.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
             if message.get("text") is not None:
                 control = json.loads(message["text"])
                 kind = control.get("type")
