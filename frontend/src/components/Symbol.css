@@ -1,0 +1,41 @@
+.symbol {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.symbol__img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  -webkit-user-select: none;
+  user-select: none;
+  pointer-events: none;
+}
+
+/* Loading shimmer while resolveSymbol() is in flight. */
+.symbol__shimmer {
+  width: 70%;
+  aspect-ratio: 1 / 1;
+  border-radius: 10px;
+  background: linear-gradient(
+    100deg,
+    rgba(0, 0, 0, 0.06) 30%,
+    rgba(0, 0, 0, 0.12) 50%,
+    rgba(0, 0, 0, 0.06) 70%
+  );
+  background-size: 200% 100%;
+  animation: symbol-shimmer 1.2s ease-in-out infinite;
+}
+
+@keyframes symbol-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}

@@ -1,0 +1,23 @@
+/* Dwell loader: a circle that fills clockwise as the dwell progresses. Hidden
+   until progress > 0, a full blue (0.2 opacity) circle at progress === 1.
+   Driven by the --angle CSS var set per frame from the dwell progress. */
+.dwell-loader {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.dwell-loader__ring {
+  --s: clamp(48px, 46%, 88px);
+  width: var(--s);
+  height: var(--s);
+  border-radius: 50%;
+  background: conic-gradient(
+    rgba(var(--sonar-color), 0.8) var(--angle, 0deg),
+    transparent 0
+  );
+}
