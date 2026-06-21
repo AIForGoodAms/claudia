@@ -4,59 +4,79 @@
 
 **Goal:** A local web app where a conversation partner speaks, the backend transcribes the speech, an LLM proposes responses in the user's voice rendered as symbol sequences, and she picks one to be spoken aloud.
 
-**Architecture:** FastAPI backend with a WebSocket audio loop (browser mic → 16 kHz PCM16 frames → backend VAD endpointing → Parakeet ASR → GLM-5.2 option generation → E5 semantic search → symbol cards pushed back). A shared OpenRouter client serves all three model calls. SQLite stores symbols, per-language embeddings, persona, and the interaction/option learning log. Plain HTML/CSS/JS front-end with dwell-to-select and browser TTS.
+**Architecture:** FastAPI backend with a WebSocket audio loop (browser mic → 16 kHz PCM16 frames → backend VAD endpointing → Parakeet ASR → GLM-5.2 option generation → E5 semantic search → symbol cards pushed back). SQLite stores symbols, per-language embeddings, persona, and the interaction/option learning log. Plain HTML/CSS/JS front-end with dwell-to-select and browser TTS.
 
 **Tech Stack:** Python 3.11 · FastAPI · Uvicorn · httpx · pydantic v2 · numpy · sqlite3 (stdlib) · pytest + pytest-asyncio · vitest (front-end units) · OpenRouter (Parakeet ASR, GLM-5.2 LLM, multilingual-e5-large embeddings).
 
+## Relationship to the ARASAAC seeding plan (source of truth)
+
+The **ARASAAC seeding plan** (`docs/superpowers/plans/2026-06-21-arasaac-symbol-seeding.md`) is the **source of truth** for the symbol dictionary and the modules it owns. This plan **consumes** them and never redefines them:
+
+| Owned by the seeding plan (do NOT recreate here) | What it provides |
+|---|---|
+| `db.py` (repo root) | `connect`, `create_schema` (creates `symbols` + `symbol_terms` only), `pack_vector`/`unpack_vector` (little-endian float32 via `struct`), `symbol_exists`, `insert_symbol`, `insert_term`. Idempotent: `symbols.external_id` is `UNIQUE`, `symbol_terms` PK is `(symbol_id, lang)`. |
+| `embedder.py` (repo root) | **synchronous** `embed(texts: list[str], kind: str, *, client=None) -> list[list[float]]` (applies the E5 `passage:`/`query:` prefix); constants `MODEL_ID`, `MODEL_TAG` (`intfloat/multilingual-e5-large@1024`), `DIMS = 1024`, `BASE_URL`. |
+| `indexing/` | `arasaac.py`, `describe.py`, `seed.py`, `core_words.txt` — the offline seeding pipeline (resolve → download → compose → embed → write). Enrichment is deferred there. |
+| `conftest.py` (repo root) | puts the repo root on `sys.path` so `import db`, `import embedder`, `from indexing import …` resolve. |
+
+**Consequences for this plan:**
+- **Module layout is repo-root**, matching the seeding plan — no `app/` package. Tests import modules directly (`import persona`, `from symbol_search import search`).
+- **This plan owns only the live-path tables** — `interactions`, `options`, `persona`, `settings` — in a new `store.py`. It must NOT create `symbols`/`symbol_terms` (the seeding `db.py` owns those).
+- **Embeddings go through the seeding `embedder.py`** (sync). The live path calls it off the event loop with `asyncio.to_thread`. There is no embedder task here.
+- **There is no indexing task here** — the seeding plan builds it.
+- **Idempotency:** every schema this plan creates uses `CREATE TABLE IF NOT EXISTS`; `settings` are seeded with `INSERT OR IGNORE`; any symbol rows created in tests use the seeding `db.insert_symbol`/`insert_term`, which are idempotent through `external_id UNIQUE`.
+
 ## Global Constraints
 
-Every task's requirements implicitly include this section. Values are copied verbatim from the spec.
+Every task's requirements implicitly include this section. Values copied verbatim from the specs.
 
-- **Python:** 3.11.
-- **Model ids (OpenRouter):** ASR `nvidia/parakeet-tdt-0.6b-v3`; LLM `z-ai/glm-5.2`; embeddings `intfloat/multilingual-e5-large`.
-- **Embedding dims:** 1024. E5 requires input prefixes — `query: ` on lookup text, `passage: ` on stored descriptions.
-- **One external API key:** `OPENROUTER_API_KEY`. Base URL `https://openrouter.ai/api/v1` (OpenAI-compatible). No other paid vendor.
+- **Python:** 3.11. **Module layout:** repo-root modules (no `app/` package); tests run from repo root.
+- **Model ids (OpenRouter):** ASR `nvidia/parakeet-tdt-0.6b-v3`; LLM `z-ai/glm-5.2`; embeddings `intfloat/multilingual-e5-large` (provided by the seeding `embedder.py`).
+- **Embedding dims:** 1024, stored as little-endian `float32`. E5 prefixes — `query: ` on lookup text, `passage: ` on stored descriptions — applied inside `embedder.embed`, never by callers.
+- **One external API key:** `OPENROUTER_API_KEY`. Base URL `https://openrouter.ai/api/v1` (OpenAI-compatible).
 - **Audio:** 16 kHz mono PCM16, ~20 ms frames.
 - **Default settings:** `lang='nl'`, `option_count='5'`, `match_threshold='0.30'`, `vad_silence_ms='800'`, `echo_guard_ms='300'`, `asr_model='nvidia/parakeet-tdt-0.6b-v3'`.
 - **Languages:** Dutch primary, English supported. `settings.lang` is the single source of truth.
-- **Naming (per CLAUDE.md):** full words, booleans as questions (`is_*`/`has_*`), functions are verbs, no noise words (`data`/`info`/`manager`/`helper`/`util`). Comment the *why*, not the *what*.
+- **Naming (per CLAUDE.md):** full words, booleans as questions (`is_*`/`has_*`), functions are verbs, no noise words. Comment the *why*, not the *what*.
 - **No confidently-wrong symbols:** a gloss whose best match is below `match_threshold` renders as text, not a picture.
 
 ---
 
 ## Parallelization Plan
 
-**How to read dependencies:** a task may start once every task in its "Depends on" list has merged. Within a wave, no two tasks write the same file, so they can run as concurrent subagents.
+**How to read dependencies:** a task may start once every task in its "Depends on" list has merged. Within a wave, no two tasks write the same file.
 
-| Task | Title | Wave | Depends on | New files (no overlap with siblings) |
+**Cross-plan dependencies:** T11 and T17 consume the seeding plan's `embedder.py` and `db.py`. Those must be merged first (the seeding plan's Tasks 3 and 4), or run the seeding plan to completion before this plan's Wave 3.
+
+| Task | Title | Wave | Depends on | New files (no overlap with siblings or the seeding plan) |
 |---|---|---|---|---|
-| T1 | Scaffold, deps, config, models | 0 | — | `pyproject.toml`, `app/config.py`, `app/models.py`, `tests/conftest.py` |
-| T2 | Database + settings + vector helpers | 1 | T1 | `app/db.py`, `tests/test_db.py` |
-| T3 | OpenRouter client | 1 | T1 | `app/openrouter.py`, `tests/test_openrouter.py` |
-| T4 | Audio segmenter (VAD endpointing) | 1 | T1 | `app/audio_stream.py`, `app/vad.py`, `tests/test_audio_stream.py` |
-| T5 | Utterance composer | 1 | T1 | `app/utterance.py`, `tests/test_utterance.py` |
+| T1 | Scaffold, deps, config, models | 0 | — | `pyproject.toml`, `config.py`, `models.py`, `tests/conftest.py`, `media/.gitkeep` |
+| T2 | Live-path store + settings | 1 | T1 | `store.py`, `tests/test_store.py` |
+| T3 | OpenRouter client (chat + transcribe) | 1 | T1 | `openrouter.py`, `tests/test_openrouter.py` |
+| T4 | Audio segmenter (VAD endpointing) | 1 | T1 | `audio_stream.py`, `vad.py`, `tests/test_audio_stream.py` |
+| T5 | Utterance composer | 1 | T1 | `utterance.py`, `tests/test_utterance.py` |
 | T6 | Front-end pure utilities | 1 | T1 | `frontend/src/{downsample,echo-gate,selection-input}.js`, `frontend/test/*`, `frontend/package.json` |
-| T7 | Persona + learning log | 2 | T2 | `app/persona.py`, `tests/test_persona.py` |
-| T8 | Embedder | 2 | T3 | `app/embedder.py`, `tests/test_embedder.py` |
-| T9 | Transcriber | 2 | T3 | `app/transcriber.py`, `tests/test_transcriber.py` |
-| T10 | Option generator | 2 | T3 | `app/option_generator.py`, `tests/test_option_generator.py` |
-| T11 | Symbol search | 3 | T8, T2 | `app/symbol_search.py`, `tests/test_symbol_search.py` |
-| T12 | Translator | 4 | T11, T3 | `app/translator.py`, `tests/test_translator.py` |
-| T13 | Indexing pipeline | 4 | T2, T3, T8 | `indexing/*.py`, `tests/test_indexing.py` |
-| T14 | API + orchestration (REST + WS) | 5 | T2,T4,T5,T7,T9,T10,T12 | `app/api.py`, `app/main.py`, `tests/test_api.py` |
+| T7 | Persona + learning log | 2 | T2 | `persona.py`, `tests/test_persona.py` |
+| ~~T8~~ | ~~Embedder~~ | — | — | **REMOVED — provided by the seeding plan's `embedder.py`.** |
+| T9 | Transcriber | 2 | T3 | `transcriber.py`, `tests/test_transcriber.py` |
+| T10 | Option generator | 2 | T3 | `option_generator.py`, `tests/test_option_generator.py` |
+| T11 | Symbol search | 3 | seeding `embedder.py` + seeding `db.py` + T1 | `symbol_search.py`, `tests/test_symbol_search.py` |
+| T12 | Translator | 4 | T11, T3 | `translator.py`, `tests/test_translator.py` |
+| ~~T13~~ | ~~Indexing pipeline~~ | — | — | **REMOVED — owned entirely by the ARASAAC seeding plan.** |
+| T14 | API + orchestration (REST + WS) | 5 | T2,T4,T5,T7,T9,T10,T12 | `api.py`, `main.py`, `tests/test_api.py` |
 | T15 | End-to-end integration test | 6 | T14 | `tests/test_integration.py` |
 | T16 | Front-end integration | 6 | T14, T6 | `frontend/index.html`, `frontend/styles.css`, `frontend/src/{app,ws-client,audio-capture,pcm-worklet,tts}.js`, `frontend/test/smoke.spec.js` |
-| T17 | Retrieval eval harness | 6 | T12, T13 | `tests/test_retrieval_eval.py`, `tests/fixtures/recall_set.json` |
+| T17 | Retrieval eval harness | 6 | T11 + seeding `db.py`/`embedder.py` | `tests/test_retrieval_eval.py`, `tests/fixtures/recall_set.json` |
 
 **Sequencing rationale:**
-- T1 is alone in Wave 0 because all 16 other tasks import `models.py` and `config.py`. Defining every shared type and dependency once, up front, is what makes the later waves conflict-free.
-- Wave 1 (5 agents) holds everything that needs only T1: the DB, the HTTP client, the VAD state machine, the trivial composer, and the front-end pure functions.
-- Wave 2 (4 agents) holds the thin model wrappers (embedder/transcriber/option-gen need T3) and the persona store (needs T2). They do not depend on each other.
-- T11 → T12 are serial because the translator calls symbol search; symbol search calls the embedder. This is the one unavoidable chain.
-- T14 is the integration barrier — a single agent wires the orchestration so type mismatches surface in one place.
+- T1 is alone in Wave 0 because all live-path tasks import `models.py`/`config.py`. Defining every shared type and dependency once, up front, keeps the later waves conflict-free.
+- Wave 1 (5 agents) holds everything needing only T1: the live-path store, the HTTP client, the VAD state machine, the composer, and the front-end pure functions.
+- Wave 2 (3 agents) holds the thin model wrappers (transcriber/option-gen need T3) and the persona store (needs T2). The former embedder task is gone.
+- T11 → T12 are serial (translator calls symbol search; symbol search calls the seeding embedder). This is the one unavoidable chain, and it also gates on the seeding plan having shipped `embedder.py`/`db.py`.
+- T14 is the integration barrier — one agent wires orchestration so type mismatches surface in one place.
 - Wave 6 (3 agents) are independent verification/UI tasks over the finished backend.
 
-**Run all tests:** backend `pytest -q`; front-end `cd frontend && npm test`.
+**Run all tests:** backend `pytest -q` (from repo root); front-end `cd frontend && npm test`.
 
 ---
 
@@ -64,18 +84,16 @@ Every task's requirements implicitly include this section. Values are copied ver
 
 **Files:**
 - Create: `pyproject.toml`
-- Create: `app/__init__.py` (empty)
-- Create: `app/config.py`
-- Create: `app/models.py`
-- Create: `tests/__init__.py` (empty)
+- Create: `config.py`
+- Create: `models.py`
 - Create: `tests/conftest.py`
 - Create: `media/.gitkeep` (empty)
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `app.config` constants (`OPENROUTER_BASE_URL`, `MODEL_ASR`, `MODEL_LLM`, `MODEL_EMBED`, `EMBED_DIM`, `DB_PATH`, `MEDIA_DIR`, `DEFAULT_SETTINGS`); `app.models` pydantic types `Segment, Transcript, Candidate, Match, SymbolCard, Option, Persona, Pick, Utterance`.
+- Produces: `config` constants (`OPENROUTER_BASE_URL`, `OPENROUTER_API_KEY`, `MODEL_ASR`, `MODEL_LLM`, `DB_PATH`, `MEDIA_DIR`, `DEFAULT_SETTINGS`); `models` pydantic types `Segment, Transcript, Candidate, Match, SymbolCard, Option, Persona, Pick, Utterance`; a `conn` test fixture that builds the full schema from both `db.create_schema` (seeding) and `store.create_schema`.
 
-- [ ] **Step 1: Create `pyproject.toml` pinning every dependency** (so no later task edits the dep file)
+- [ ] **Step 1: Create `pyproject.toml`** (pins deps for BOTH plans, so the seeding plan's "separate setup pass" is satisfied here)
 
 ```toml
 [project]
@@ -101,7 +119,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 ```
 
-- [ ] **Step 2: Write `app/config.py`**
+- [ ] **Step 2: Write `config.py`**
 
 ```python
 import os
@@ -112,10 +130,9 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 MODEL_ASR = "nvidia/parakeet-tdt-0.6b-v3"
 MODEL_LLM = "z-ai/glm-5.2"
-MODEL_EMBED = "intfloat/multilingual-e5-large"
-EMBED_DIM = 1024
+# Embedding model id/dims live in the seeding plan's embedder.py (MODEL_ID, DIMS).
 
-DB_PATH = Path(os.environ.get("AAC_DB_PATH", "aac.db"))
+DB_PATH = Path(os.environ.get("AAC_DB_PATH", "symbols.db"))   # same default as seeding seed.py
 MEDIA_DIR = Path(os.environ.get("AAC_MEDIA_DIR", "media"))
 
 DEFAULT_SETTINGS = {
@@ -128,7 +145,7 @@ DEFAULT_SETTINGS = {
 }
 ```
 
-- [ ] **Step 3: Write `app/models.py`** (every shared type — later tasks import from here)
+- [ ] **Step 3: Write `models.py`**
 
 ```python
 from pydantic import BaseModel
@@ -185,114 +202,97 @@ class Utterance(BaseModel):
     lang: str
 ```
 
-- [ ] **Step 4: Write `tests/conftest.py`** (shared fixtures — a fresh initialized DB per test)
+- [ ] **Step 4: Write `tests/conftest.py`** (root on path + a `conn` fixture spanning both schema owners)
 
 ```python
+import sys
 import sqlite3
+from pathlib import Path
 import pytest
+
+# Repo root on sys.path so `import db`, `import embedder`, `import store`, etc. resolve.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 @pytest.fixture
 def conn():
-    # In-memory DB initialized with the schema. db.init_db is added in Task 2;
-    # importing here is safe because conftest is only collected once db.py exists.
-    from app import db
+    import db        # seeding plan: creates symbols + symbol_terms
+    import store     # this plan: creates interactions, options, persona, settings
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    db.init_db(connection)
+    db.create_schema(connection)
+    store.create_schema(connection)
     yield connection
     connection.close()
 ```
 
-- [ ] **Step 5: Verify the package imports**
+- [ ] **Step 5: Verify the modules import**
 
-Run: `python -c "import app.config, app.models; print(app.config.EMBED_DIM)"`
-Expected: prints `1024`
+Run: `python -c "import config, models; print(config.MODEL_LLM)"`
+Expected: prints `z-ai/glm-5.2`
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add pyproject.toml app/ tests/ media/.gitkeep
-git commit -m "chore: scaffold app package, config, and shared models"
+git add pyproject.toml config.py models.py tests/conftest.py media/.gitkeep
+git commit -m "chore: scaffold deps, config, shared models, and test fixture"
 ```
 
 ---
 
-## Task 2: Database layer, settings, vector helpers
+## Task 2: Live-path store + settings
 
 **Files:**
-- Create: `app/db.py`
-- Test: `tests/test_db.py`
+- Create: `store.py`
+- Test: `tests/test_store.py`
 
 **Interfaces:**
-- Consumes: `app.config.DEFAULT_SETTINGS`, `app.config.EMBED_DIM`.
+- Consumes: `config.DEFAULT_SETTINGS`.
 - Produces:
-  - `init_db(conn)` — creates all tables (spec §6) and seeds `DEFAULT_SETTINGS`.
+  - `create_schema(conn)` — creates `interactions`, `options`, `persona`, `settings` with `IF NOT EXISTS`, then seeds `DEFAULT_SETTINGS` with `INSERT OR IGNORE` (idempotent). Does NOT touch `symbols`/`symbol_terms`.
   - `get_setting(conn, key) -> str` (falls back to `DEFAULT_SETTINGS`).
   - `set_setting(conn, key, value)`.
-  - `vec_to_blob(values: list[float]) -> bytes` and `blob_to_vec(blob: bytes) -> numpy.ndarray` (float32).
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-import numpy as np
-from app import db
+import store
 
 
-def test_init_db_seeds_default_settings(conn):
-    assert db.get_setting(conn, "lang") == "nl"
-    assert db.get_setting(conn, "match_threshold") == "0.30"
+def test_seeds_default_settings(conn):
+    assert store.get_setting(conn, "lang") == "nl"
+    assert store.get_setting(conn, "match_threshold") == "0.30"
 
 
-def test_set_setting_overrides_default(conn):
-    db.set_setting(conn, "lang", "en")
-    assert db.get_setting(conn, "lang") == "en"
+def test_set_setting_overrides(conn):
+    store.set_setting(conn, "lang", "en")
+    assert store.get_setting(conn, "lang") == "en"
 
 
-def test_vector_blob_roundtrip():
-    values = [0.1, -0.2, 0.3]
-    restored = db.blob_to_vec(db.vec_to_blob(values))
-    assert np.allclose(restored, np.array(values, dtype=np.float32))
+def test_create_schema_is_idempotent(conn):
+    store.create_schema(conn)            # second call must not raise or duplicate settings
+    rows = conn.execute("SELECT COUNT(*) FROM settings").fetchone()[0]
+    assert rows == len(store.config.DEFAULT_SETTINGS)
 
 
-def test_tables_exist(conn):
+def test_live_tables_exist(conn):
     names = {r["name"] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"symbols", "symbol_terms", "interactions",
-            "options", "persona", "settings"} <= names
+    assert {"interactions", "options", "persona", "settings"} <= names
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/test_db.py -v`
-Expected: FAIL — `ModuleNotFoundError`/`AttributeError: module 'app.db' has no attribute 'init_db'`
+Run: `pytest tests/test_store.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'store'`
 
-- [ ] **Step 3: Write `app/db.py`**
+- [ ] **Step 3: Write `store.py`**
 
 ```python
-import sqlite3
-import numpy as np
-from app import config
+import config
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS symbols (
-  id           INTEGER PRIMARY KEY,
-  source       TEXT NOT NULL,
-  external_id  TEXT,
-  image_path   TEXT NOT NULL,
-  is_core      INTEGER NOT NULL DEFAULT 0,
-  created_at   TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS symbol_terms (
-  symbol_id    INTEGER NOT NULL REFERENCES symbols(id),
-  lang         TEXT NOT NULL,
-  label        TEXT NOT NULL,
-  description  TEXT NOT NULL,
-  vector       BLOB NOT NULL,
-  model        TEXT NOT NULL,
-  PRIMARY KEY (symbol_id, lang)
-);
 CREATE TABLE IF NOT EXISTS interactions (
   id                 INTEGER PRIMARY KEY,
   ts                 TEXT NOT NULL,
@@ -324,7 +324,7 @@ CREATE TABLE IF NOT EXISTS settings (
 """
 
 
-def init_db(conn: sqlite3.Connection) -> None:
+def create_schema(conn) -> None:
     conn.executescript(SCHEMA)
     for key, value in config.DEFAULT_SETTINGS.items():
         conn.execute(
@@ -332,62 +332,54 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def get_setting(conn: sqlite3.Connection, key: str) -> str:
+def get_setting(conn, key: str) -> str:
     row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
     if row is not None:
-        return row["value"] if isinstance(row, sqlite3.Row) else row[0]
+        return row["value"] if hasattr(row, "keys") else row[0]
     return config.DEFAULT_SETTINGS[key]
 
 
-def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+def set_setting(conn, key: str, value: str) -> None:
     conn.execute(
         "INSERT INTO settings(key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
     conn.commit()
-
-
-def vec_to_blob(values) -> bytes:
-    return np.asarray(values, dtype=np.float32).tobytes()
-
-
-def blob_to_vec(blob: bytes) -> np.ndarray:
-    return np.frombuffer(blob, dtype=np.float32)
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `pytest tests/test_db.py -v`
+Run: `pytest tests/test_store.py -v`
 Expected: PASS (4 tests)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app/db.py tests/test_db.py
-git commit -m "feat: sqlite schema, settings accessor, vector blob helpers"
+git add store.py tests/test_store.py
+git commit -m "feat: live-path store (interactions/options/persona/settings) + settings accessor"
 ```
 
 ---
 
-## Task 3: OpenRouter client
+## Task 3: OpenRouter client (chat + transcribe)
 
 **Files:**
-- Create: `app/openrouter.py`
+- Create: `openrouter.py`
 - Test: `tests/test_openrouter.py`
 
 **Interfaces:**
-- Consumes: `app.config` (base url, api key).
-- Produces (all async, module-level so consumers monkeypatch easily):
+- Consumes: `config` (base url, api key).
+- Produces (async; module-level so consumers monkeypatch easily):
   - `chat(messages: list[dict], model: str, temperature: float = 0.7, response_format: dict | None = None) -> str` — returns the assistant message content.
-  - `embed(texts: list[str], model: str) -> list[list[float]]`.
   - `transcribe(wav_bytes: bytes, model: str, language: str | None = None) -> str` — returns transcript text.
 
-- [ ] **Step 1: Write the failing test** (using `httpx.MockTransport` — no network, no extra dep)
+(Embeddings are NOT here — they go through the seeding plan's `embedder.py`.)
+
+- [ ] **Step 1: Write the failing test** (`httpx.MockTransport` — no network)
 
 ```python
 import json
 import httpx
-import pytest
-from app import openrouter
+import openrouter
 
 
 def _client_with(handler):
@@ -398,24 +390,12 @@ def _client_with(handler):
 async def test_chat_returns_message_content(monkeypatch):
     def handler(request):
         assert request.url.path.endswith("/chat/completions")
-        body = json.loads(request.content)
-        assert body["model"] == "z-ai/glm-5.2"
-        return httpx.Response(200, json={
-            "choices": [{"message": {"content": "hallo"}}]})
+        assert json.loads(request.content)["model"] == "z-ai/glm-5.2"
+        return httpx.Response(200, json={"choices": [{"message": {"content": "hallo"}}]})
 
     monkeypatch.setattr(openrouter, "_make_client", lambda: _client_with(handler))
     out = await openrouter.chat([{"role": "user", "content": "hi"}], model="z-ai/glm-5.2")
     assert out == "hallo"
-
-
-async def test_embed_returns_vectors(monkeypatch):
-    def handler(request):
-        assert request.url.path.endswith("/embeddings")
-        return httpx.Response(200, json={"data": [{"embedding": [0.1, 0.2]}]})
-
-    monkeypatch.setattr(openrouter, "_make_client", lambda: _client_with(handler))
-    out = await openrouter.embed(["query: hi"], model="intfloat/multilingual-e5-large")
-    assert out == [[0.1, 0.2]]
 
 
 async def test_transcribe_returns_text(monkeypatch):
@@ -431,13 +411,13 @@ async def test_transcribe_returns_text(monkeypatch):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_openrouter.py -v`
-Expected: FAIL — `module 'app.openrouter' has no attribute '_make_client'`
+Expected: FAIL — `module 'openrouter' has no attribute '_make_client'`
 
-- [ ] **Step 3: Write `app/openrouter.py`**
+- [ ] **Step 3: Write `openrouter.py`**
 
 ```python
 import httpx
-from app import config
+import config
 
 
 def _make_client() -> httpx.AsyncClient:
@@ -458,13 +438,6 @@ async def chat(messages, model, temperature=0.7, response_format=None) -> str:
         return response.json()["choices"][0]["message"]["content"]
 
 
-async def embed(texts, model) -> list[list[float]]:
-    async with _make_client() as client:
-        response = await client.post("/embeddings", json={"model": model, "input": texts})
-        response.raise_for_status()
-        return [row["embedding"] for row in response.json()["data"]]
-
-
 async def transcribe(wav_bytes, model, language=None) -> str:
     files = {"file": ("utterance.wav", wav_bytes, "audio/wav")}
     form = {"model": model}
@@ -479,13 +452,13 @@ async def transcribe(wav_bytes, model, language=None) -> str:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/test_openrouter.py -v`
-Expected: PASS (3 tests)
+Expected: PASS (2 tests)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app/openrouter.py tests/test_openrouter.py
-git commit -m "feat: OpenRouter client for chat, embeddings, transcription"
+git add openrouter.py tests/test_openrouter.py
+git commit -m "feat: OpenRouter client for chat and transcription"
 ```
 
 ---
@@ -493,46 +466,45 @@ git commit -m "feat: OpenRouter client for chat, embeddings, transcription"
 ## Task 4: Audio segmenter (VAD endpointing)
 
 **Files:**
-- Create: `app/audio_stream.py` (the testable state machine)
-- Create: `app/vad.py` (the real detectors; selected at runtime)
+- Create: `audio_stream.py` (the testable state machine)
+- Create: `vad.py` (the real detectors; selected at runtime)
 - Test: `tests/test_audio_stream.py`
 
 **Interfaces:**
-- Consumes: `app.models.Segment`.
+- Consumes: `models.Segment`.
 - Produces:
-  - `Segmenter(detector, sample_rate=16000, frame_ms=20, silence_ms=800)` with `feed(frame: bytes) -> Segment | None` and `reset() -> None`. `detector` is any callable `bytes -> bool` (is-speech). Emits a `Segment` when speech is followed by `silence_ms` of non-speech; returns `None` otherwise.
-  - `app.vad.EnergyDetector(threshold=...)` (pure numpy, dev/CI default) and `app.vad.SileroDetector()` (lazy torch import, production). Both are callables `bytes -> bool`.
+  - `Segmenter(detector, sample_rate=16000, frame_ms=20, silence_ms=800)` with `feed(frame: bytes) -> Segment | None` and `reset() -> None`. `detector` is any callable `bytes -> bool`. Emits a `Segment` when speech is followed by `silence_ms` of non-speech.
+  - `vad.EnergyDetector(threshold=...)` (pure numpy, dev/CI default) and `vad.SileroDetector()` (lazy torch import, production). Both callables `bytes -> bool`.
 
-- [ ] **Step 1: Write the failing test** (a fake detector scripts speech/silence; logic is fully deterministic)
+- [ ] **Step 1: Write the failing test**
 
 ```python
-from app.audio_stream import Segmenter
+from audio_stream import Segmenter
 
 FRAME = b"\x00\x00" * 320            # 20 ms of silence at 16 kHz (640 bytes)
 VOICE = b"\x10\x00" * 320            # 20 ms of "speech"
 
 
 class ScriptedDetector:
-    """Returns speech=True for VOICE frames, False for FRAME frames."""
     def __call__(self, frame: bytes) -> bool:
         return frame == VOICE
 
 
 def test_emits_segment_after_trailing_silence():
-    seg = Segmenter(ScriptedDetector(), silence_ms=40, frame_ms=20)  # 2 silent frames end it
+    seg = Segmenter(ScriptedDetector(), silence_ms=40, frame_ms=20)
     assert seg.feed(VOICE) is None
     assert seg.feed(VOICE) is None
-    assert seg.feed(FRAME) is None           # 1st silent frame: 20 ms < 40 ms
-    out = seg.feed(FRAME)                     # 2nd silent frame: endpoint reached
+    assert seg.feed(FRAME) is None           # 20 ms < 40 ms
+    out = seg.feed(FRAME)                     # endpoint reached
     assert out is not None
-    assert out.pcm == VOICE + VOICE          # only the speech frames, silence trimmed
+    assert out.pcm == VOICE + VOICE          # trailing silence trimmed
 
 
 def test_ignores_leading_silence():
     seg = Segmenter(ScriptedDetector(), silence_ms=40, frame_ms=20)
     assert seg.feed(FRAME) is None
     assert seg.feed(FRAME) is None
-    assert seg.feed(VOICE) is None           # speech started, nothing emitted yet
+    assert seg.feed(VOICE) is None
 
 
 def test_reset_discards_buffer():
@@ -540,26 +512,26 @@ def test_reset_discards_buffer():
     seg.feed(VOICE)
     seg.reset()
     assert seg.feed(FRAME) is None
-    assert seg.feed(FRAME) is None           # no buffered speech → no segment
+    assert seg.feed(FRAME) is None
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_audio_stream.py -v`
-Expected: FAIL — `ModuleNotFoundError: No module named 'app.audio_stream'`
+Expected: FAIL — `No module named 'audio_stream'`
 
-- [ ] **Step 3: Write `app/audio_stream.py`**
+- [ ] **Step 3: Write `audio_stream.py`**
 
 ```python
-from app.models import Segment
+from models import Segment
 
 
 class Segmenter:
     """Turns a stream of fixed-size frames into utterance-sized Segments.
 
     Buffers consecutive speech frames; once `silence_ms` of non-speech follows
-    speech, the buffered speech is emitted as one Segment (trailing silence
-    trimmed) and the buffer resets.
+    speech, emits the buffered speech as one Segment (trailing silence trimmed)
+    and resets.
     """
 
     def __init__(self, detector, sample_rate=16000, frame_ms=20, silence_ms=800):
@@ -574,14 +546,11 @@ class Segmenter:
             self._speech_frames.append(frame)
             self._trailing_silence = 0
             return None
-
         if not self._speech_frames:
-            return None                      # silence before any speech: ignore
-
+            return None
         self._trailing_silence += 1
         if self._trailing_silence < self._silence_frames_needed:
             return None
-
         pcm = b"".join(self._speech_frames)
         self.reset()
         return Segment(pcm=pcm, sample_rate=self._sample_rate)
@@ -596,7 +565,7 @@ class Segmenter:
 Run: `pytest tests/test_audio_stream.py -v`
 Expected: PASS (3 tests)
 
-- [ ] **Step 5: Write `app/vad.py`** (real detectors; not unit-tested — exercised in the WS smoke later)
+- [ ] **Step 5: Write `vad.py`** (real detectors; exercised in the WS smoke later)
 
 ```python
 import numpy as np
@@ -612,8 +581,7 @@ class EnergyDetector:
         samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
         if samples.size == 0:
             return False
-        rms = float(np.sqrt(np.mean(samples ** 2)))
-        return rms >= self._threshold
+        return float(np.sqrt(np.mean(samples ** 2))) >= self._threshold
 
 
 class SileroDetector:
@@ -630,14 +598,13 @@ class SileroDetector:
             self._model = load_silero_vad()
         import torch
         samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
-        prob = self._model(torch.from_numpy(samples), self._sample_rate).item()
-        return prob >= self._threshold
+        return self._model(torch.from_numpy(samples), self._sample_rate).item() >= self._threshold
 ```
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add app/audio_stream.py app/vad.py tests/test_audio_stream.py
+git add audio_stream.py vad.py tests/test_audio_stream.py
 git commit -m "feat: VAD segmenter with endpointing + energy/silero detectors"
 ```
 
@@ -646,23 +613,22 @@ git commit -m "feat: VAD segmenter with endpointing + energy/silero detectors"
 ## Task 5: Utterance composer
 
 **Files:**
-- Create: `app/utterance.py`
+- Create: `utterance.py`
 - Test: `tests/test_utterance.py`
 
 **Interfaces:**
-- Consumes: `app.models.Utterance`.
-- Produces: `compose(text: str, lang: str) -> Utterance`. The seam where a chosen option becomes final spoken text (room for future post-processing; today it normalizes whitespace).
+- Consumes: `models.Utterance`.
+- Produces: `compose(text: str, lang: str) -> Utterance` (normalizes whitespace; the seam for future post-processing).
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-from app.utterance import compose
+from utterance import compose
 
 
 def test_compose_returns_text_and_lang():
     out = compose("ik wil koffie", "nl")
-    assert out.text == "ik wil koffie"
-    assert out.lang == "nl"
+    assert out.text == "ik wil koffie" and out.lang == "nl"
 
 
 def test_compose_collapses_whitespace():
@@ -672,12 +638,12 @@ def test_compose_collapses_whitespace():
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_utterance.py -v`
-Expected: FAIL — `No module named 'app.utterance'`
+Expected: FAIL — `No module named 'utterance'`
 
-- [ ] **Step 3: Write `app/utterance.py`**
+- [ ] **Step 3: Write `utterance.py`**
 
 ```python
-from app.models import Utterance
+from models import Utterance
 
 
 def compose(text: str, lang: str) -> Utterance:
@@ -692,7 +658,7 @@ Expected: PASS (2 tests)
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app/utterance.py tests/test_utterance.py
+git add utterance.py tests/test_utterance.py
 git commit -m "feat: utterance composer normalizes chosen option text"
 ```
 
@@ -702,17 +668,15 @@ git commit -m "feat: utterance composer normalizes chosen option text"
 
 **Files:**
 - Create: `frontend/package.json`
-- Create: `frontend/src/downsample.js`
-- Create: `frontend/src/echo-gate.js`
-- Create: `frontend/src/selection-input.js`
+- Create: `frontend/src/downsample.js`, `frontend/src/echo-gate.js`, `frontend/src/selection-input.js`
 - Test: `frontend/test/downsample.test.js`, `frontend/test/echo-gate.test.js`, `frontend/test/selection-input.test.js`
 
 **Interfaces:**
 - Consumes: nothing.
 - Produces (ES modules):
-  - `downsampleTo16k(float32, inputRate) -> Int16Array` — resample mono Float32 [-1,1] to 16 kHz PCM16.
-  - `EchoGate({ guardMs, now })` with `startSpeaking()`, `stopSpeaking()`, `isMuted()` — true from `startSpeaking()` until `guardMs` after `stopSpeaking()`.
-  - `DwellSelector({ dwellMs, onSelect, now })` with `enter(targetId)`, `leave()`, `tick()` — fires `onSelect(targetId)` once gaze/pointer dwells `dwellMs` on one target.
+  - `downsampleTo16k(float32, inputRate) -> Int16Array`.
+  - `EchoGate({ guardMs, now })` with `startSpeaking()`, `stopSpeaking()`, `isMuted()`.
+  - `DwellSelector({ dwellMs, onSelect, now })` with `enter(targetId)`, `leave()`, `tick()`.
 
 - [ ] **Step 1: Write `frontend/package.json`**
 
@@ -735,10 +699,9 @@ import { downsampleTo16k } from "../src/downsample.js";
 
 describe("downsampleTo16k", () => {
   it("halves a 32 kHz buffer to 16 kHz", () => {
-    const input = new Float32Array(32000).fill(1.0);
-    const out = downsampleTo16k(input, 32000);
+    const out = downsampleTo16k(new Float32Array(32000).fill(1.0), 32000);
     expect(out.length).toBe(16000);
-    expect(out[0]).toBe(32767);            // 1.0 → max PCM16
+    expect(out[0]).toBe(32767);
   });
   it("passes 16 kHz through unchanged in length", () => {
     expect(downsampleTo16k(new Float32Array(1600), 16000).length).toBe(1600);
@@ -759,8 +722,8 @@ describe("EchoGate", () => {
     gate.startSpeaking();
     expect(gate.isMuted()).toBe(true);
     gate.stopSpeaking();
-    t = 200; expect(gate.isMuted()).toBe(true);   // within guard tail
-    t = 350; expect(gate.isMuted()).toBe(false);  // tail elapsed
+    t = 200; expect(gate.isMuted()).toBe(true);
+    t = 350; expect(gate.isMuted()).toBe(false);
   });
 });
 ```
@@ -804,8 +767,7 @@ export function downsampleTo16k(float32, inputRate) {
   const outLength = Math.round(float32.length / ratio);
   const out = new Int16Array(outLength);
   for (let i = 0; i < outLength; i++) {
-    const sample = float32[Math.floor(i * ratio)];
-    const clamped = Math.max(-1, Math.min(1, sample));
+    const clamped = Math.max(-1, Math.min(1, float32[Math.floor(i * ratio)]));
     out[i] = clamped < 0 ? clamped * 32768 : clamped * 32767;
   }
   return out;
@@ -867,14 +829,14 @@ git commit -m "feat: front-end pure utils (downsample, echo gate, dwell select)"
 ## Task 7: Persona + learning log
 
 **Files:**
-- Create: `app/persona.py`
+- Create: `persona.py`
 - Test: `tests/test_persona.py`
 
 **Interfaces:**
-- Consumes: `app.db`, `app.models.{Persona, Pick}`.
+- Consumes: `store` schema (tables exist via the `conn` fixture), `models.{Persona, Pick}`.
 - Produces (sync, operate on a sqlite connection):
   - `load(conn) -> Persona`.
-  - `recent(conn, n) -> list[Pick]` — last `n` interactions that have a selected option.
+  - `recent(conn, n) -> list[Pick]` — last `n` interactions with a selected option.
   - `log_interaction(conn, lang, context_type, context_text, audio_path=None, asr_model=None) -> int`.
   - `save_options(conn, interaction_id, rows) -> list[int]` where each row is `{"rank": int, "text": str, "glosses": list[str], "symbol_sequence": list[int]}`; returns option ids in rank order.
   - `mark_selected(conn, interaction_id, option_id) -> str` — sets `was_selected=1`, returns the option text; raises `KeyError` if the pair is unknown.
@@ -883,20 +845,15 @@ git commit -m "feat: front-end pure utils (downsample, echo gate, dwell select)"
 
 ```python
 import pytest
-from app import persona
-
-
-def _seed_persona(conn):
-    conn.execute("INSERT INTO persona(id, profile, reading_level, updated_at) "
-                 "VALUES (1, 'warm, direct', 'simple', '2026-06-21')")
-    conn.commit()
+import persona
 
 
 def test_load_returns_profile(conn):
-    _seed_persona(conn)
+    conn.execute("INSERT INTO persona(id, profile, reading_level, updated_at) "
+                 "VALUES (1, 'warm, direct', 'simple', '2026-06-21')")
+    conn.commit()
     p = persona.load(conn)
-    assert p.profile == "warm, direct"
-    assert p.reading_level == "simple"
+    assert p.profile == "warm, direct" and p.reading_level == "simple"
 
 
 def test_log_and_recent_roundtrip(conn):
@@ -905,8 +862,7 @@ def test_log_and_recent_roundtrip(conn):
         {"rank": 0, "text": "ja graag", "glosses": ["ja"], "symbol_sequence": [1]},
         {"rank": 1, "text": "nee dank je", "glosses": ["nee"], "symbol_sequence": [2]},
     ])
-    text = persona.mark_selected(conn, iid, ids[0])
-    assert text == "ja graag"
+    assert persona.mark_selected(conn, iid, ids[0]) == "ja graag"
     picks = persona.recent(conn, n=5)
     assert picks[0].context_text == "wil je koffie?"
     assert picks[0].selected_text == "ja graag"
@@ -921,14 +877,14 @@ def test_mark_selected_unknown_raises(conn):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_persona.py -v`
-Expected: FAIL — `No module named 'app.persona'`
+Expected: FAIL — `No module named 'persona'`
 
-- [ ] **Step 3: Write `app/persona.py`**
+- [ ] **Step 3: Write `persona.py`**
 
 ```python
 import json
 from datetime import datetime, timezone
-from app.models import Persona, Pick
+from models import Persona, Pick
 
 
 def _now_iso() -> str:
@@ -993,114 +949,34 @@ Expected: PASS (3 tests)
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app/persona.py tests/test_persona.py
+git add persona.py tests/test_persona.py
 git commit -m "feat: persona load + interaction/option learning log"
 ```
 
 ---
 
-## Task 8: Embedder
+## Task 8: REMOVED
 
-**Files:**
-- Create: `app/embedder.py`
-- Test: `tests/test_embedder.py`
-
-**Interfaces:**
-- Consumes: `app.openrouter.embed`, `app.config.{MODEL_EMBED}`.
-- Produces (async):
-  - `embed(text: str, kind: str) -> list[float]` — `kind` in `{"query", "passage"}`; prepends the E5 prefix.
-  - `embed_many(texts: list[str], kind: str) -> list[list[float]]`.
-
-- [ ] **Step 1: Write the failing test** (assert the prefix is applied — the recall-critical behavior)
-
-```python
-from app import embedder, openrouter
-
-
-async def test_embed_applies_query_prefix(monkeypatch):
-    seen = {}
-
-    async def fake_embed(texts, model):
-        seen["texts"] = texts
-        return [[0.0] * 1024 for _ in texts]
-
-    monkeypatch.setattr(openrouter, "embed", fake_embed)
-    await embedder.embed("koffie", kind="query")
-    assert seen["texts"] == ["query: koffie"]
-
-
-async def test_embed_many_applies_passage_prefix(monkeypatch):
-    seen = {}
-
-    async def fake_embed(texts, model):
-        seen["texts"] = texts
-        return [[0.1] * 1024 for _ in texts]
-
-    monkeypatch.setattr(openrouter, "embed", fake_embed)
-    out = await embedder.embed_many(["meer", "koffie"], kind="passage")
-    assert seen["texts"] == ["passage: meer", "passage: koffie"]
-    assert len(out) == 2 and len(out[0]) == 1024
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `pytest tests/test_embedder.py -v`
-Expected: FAIL — `No module named 'app.embedder'`
-
-- [ ] **Step 3: Write `app/embedder.py`**
-
-```python
-from app import openrouter, config
-
-_VALID_KINDS = {"query", "passage"}
-
-
-def _prefix(text: str, kind: str) -> str:
-    if kind not in _VALID_KINDS:
-        raise ValueError(f"kind must be one of {_VALID_KINDS}, got {kind!r}")
-    return f"{kind}: {text}"
-
-
-async def embed(text: str, kind: str) -> list[float]:
-    vectors = await openrouter.embed([_prefix(text, kind)], model=config.MODEL_EMBED)
-    return vectors[0]
-
-
-async def embed_many(texts: list[str], kind: str) -> list[list[float]]:
-    prefixed = [_prefix(text, kind) for text in texts]
-    return await openrouter.embed(prefixed, model=config.MODEL_EMBED)
-```
-
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `pytest tests/test_embedder.py -v`
-Expected: PASS (2 tests)
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add app/embedder.py tests/test_embedder.py
-git commit -m "feat: E5 embedder with query/passage prefixes"
-```
+The embedder is provided by the ARASAAC seeding plan's `embedder.py` (sync `embed(texts, kind, *, client=None)`, model `intfloat/multilingual-e5-large`, 1024-d). Consume it directly; do not create one here.
 
 ---
 
 ## Task 9: Transcriber
 
 **Files:**
-- Create: `app/transcriber.py`
+- Create: `transcriber.py`
 - Test: `tests/test_transcriber.py`
 
 **Interfaces:**
-- Consumes: `app.openrouter.transcribe`, `app.config.MODEL_ASR`, `app.models.Transcript`.
+- Consumes: `openrouter.transcribe`, `config.MODEL_ASR`, `models.Transcript`.
 - Produces (async): `transcribe(pcm: bytes, lang: str, sample_rate: int = 16000) -> Transcript` — wraps PCM16 as a WAV container and calls the ASR model.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-import struct
-from app import transcriber, openrouter
-from app.models import Transcript
+import transcriber
+import openrouter
+from models import Transcript
 
 
 async def test_transcribe_wraps_pcm_as_wav_and_returns_transcript(monkeypatch):
@@ -1122,15 +998,16 @@ async def test_transcribe_wraps_pcm_as_wav_and_returns_transcript(monkeypatch):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_transcriber.py -v`
-Expected: FAIL — `No module named 'app.transcriber'`
+Expected: FAIL — `No module named 'transcriber'`
 
-- [ ] **Step 3: Write `app/transcriber.py`**
+- [ ] **Step 3: Write `transcriber.py`**
 
 ```python
 import io
 import wave
-from app import openrouter, config
-from app.models import Transcript
+import openrouter
+import config
+from models import Transcript
 
 
 def _pcm_to_wav(pcm: bytes, sample_rate: int) -> bytes:
@@ -1157,7 +1034,7 @@ Expected: PASS (1 test)
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app/transcriber.py tests/test_transcriber.py
+git add transcriber.py tests/test_transcriber.py
 git commit -m "feat: transcriber wraps PCM as WAV and calls Parakeet"
 ```
 
@@ -1166,19 +1043,20 @@ git commit -m "feat: transcriber wraps PCM as WAV and calls Parakeet"
 ## Task 10: Option generator
 
 **Files:**
-- Create: `app/option_generator.py`
+- Create: `option_generator.py`
 - Test: `tests/test_option_generator.py`
 
 **Interfaces:**
-- Consumes: `app.openrouter.chat`, `app.config.MODEL_LLM`, `app.models.{Candidate, Persona, Pick}`.
-- Produces (async): `generate(context: str, persona: Persona, history: list[Pick], n: int, lang: str) -> list[Candidate]`. Prompts GLM-5.2 for `n` first-person responses, each `{text, glosses}`, returned as JSON; parses into `Candidate`s.
+- Consumes: `openrouter.chat`, `config.MODEL_LLM`, `models.{Candidate, Persona, Pick}`.
+- Produces (async): `generate(context: str, persona: Persona, history: list[Pick], n: int, lang: str) -> list[Candidate]`.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
 import json
-from app import option_generator, openrouter
-from app.models import Persona, Pick
+import option_generator
+import openrouter
+from models import Persona, Pick
 
 
 async def test_generate_parses_candidates(monkeypatch):
@@ -1202,7 +1080,6 @@ async def test_generate_parses_candidates(monkeypatch):
     assert captured["model"] == "z-ai/glm-5.2"
     assert [c.text for c in out] == ["ja graag", "nee dank je"]
     assert out[0].glosses == ["ja", "graag"]
-    # The prompt must carry persona, history, and the context.
     prompt = " ".join(m["content"] for m in captured["messages"])
     assert "warm, direct" in prompt and "wil je koffie?" in prompt and "goed" in prompt
 ```
@@ -1210,14 +1087,15 @@ async def test_generate_parses_candidates(monkeypatch):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_option_generator.py -v`
-Expected: FAIL — `No module named 'app.option_generator'`
+Expected: FAIL — `No module named 'option_generator'`
 
-- [ ] **Step 3: Write `app/option_generator.py`**
+- [ ] **Step 3: Write `option_generator.py`**
 
 ```python
 import json
-from app import openrouter, config
-from app.models import Candidate, Persona, Pick
+import openrouter
+import config
+from models import Candidate, Persona, Pick
 
 _SYSTEM = (
     "You generate first-person replies for a non-speaking AAC user. "
@@ -1227,7 +1105,7 @@ _SYSTEM = (
 )
 
 
-def _user_prompt(context: str, persona: Persona, history: list[Pick], n: int, lang: str) -> str:
+def _user_prompt(context, persona, history, n, lang) -> str:
     lines = [f"Language: {lang}", f"Her persona: {persona.profile}"]
     if persona.reading_level:
         lines.append(f"Reading level: {persona.reading_level}")
@@ -1245,8 +1123,7 @@ async def generate(context, persona, history, n, lang) -> list[Candidate]:
         {"role": "user", "content": _user_prompt(context, persona, history, n, lang)},
     ]
     content = await openrouter.chat(
-        messages, model=config.MODEL_LLM,
-        response_format={"type": "json_object"})
+        messages, model=config.MODEL_LLM, response_format={"type": "json_object"})
     options = json.loads(content)["options"]
     return [Candidate(text=o["text"], glosses=o["glosses"]) for o in options][:n]
 ```
@@ -1259,7 +1136,7 @@ Expected: PASS (1 test)
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app/option_generator.py tests/test_option_generator.py
+git add option_generator.py tests/test_option_generator.py
 git commit -m "feat: GLM-5.2 option generator returns {text, glosses}"
 ```
 
@@ -1268,52 +1145,50 @@ git commit -m "feat: GLM-5.2 option generator returns {text, glosses}"
 ## Task 11: Symbol search
 
 **Files:**
-- Create: `app/symbol_search.py`
+- Create: `symbol_search.py`
 - Test: `tests/test_symbol_search.py`
 
 **Interfaces:**
-- Consumes: `app.embedder.embed`, `app.db.blob_to_vec`, `app.config.{MODEL_EMBED, EMBED_DIM}`, `app.models.Match`.
-- Produces (async): `search(conn, text: str, k: int, lang: str) -> list[Match]` — embeds `text` as a query, brute-force cosine over `symbol_terms` rows for `lang`, returns the top `k` `Match`es (score in [-1, 1], descending).
+- Consumes: seeding `embedder.embed` (sync), seeding `db.{unpack_vector, insert_symbol, insert_term, pack_vector, MODEL_TAG via embedder}`, `models.Match`.
+- Produces (async): `search(conn, text: str, k: int, lang: str) -> list[Match]` — embeds `text` as a query (off the event loop via `asyncio.to_thread`), brute-force cosine over `symbol_terms` for `lang`, returns the top `k` `Match`es (descending score).
 
-- [ ] **Step 1: Write the failing test** (seed a tiny dictionary with known vectors; monkeypatch the embedder)
+- [ ] **Step 1: Write the failing test** (seed via the seeding `db` writers; monkeypatch the sync embedder)
 
 ```python
-import numpy as np
-from app import symbol_search, embedder, db
+import symbol_search
+import embedder
+import db
 
 
-def _add_symbol(conn, symbol_id, label, vector, lang="nl"):
-    conn.execute("INSERT INTO symbols(id, source, image_path, created_at) "
-                 "VALUES (?, 'arasaac', ?, '2026-06-21')",
-                 (symbol_id, f"{label}.png"))
-    conn.execute("INSERT INTO symbol_terms(symbol_id, lang, label, description, vector, model) "
-                 "VALUES (?, ?, ?, ?, ?, ?)",
-                 (symbol_id, lang, label, f"{label} desc",
-                  db.vec_to_blob(vector), "intfloat/multilingual-e5-large"))
-    conn.commit()
+def _add_symbol(conn, label, vector, lang="nl"):
+    sid = db.insert_symbol(conn, source="arasaac", external_id=label,
+                           image_path=f"media/{label}.png", is_core=1, created_at="t0")
+    db.insert_term(conn, symbol_id=sid, lang=lang, label=label,
+                   description=f"{label} desc", vector=db.pack_vector(vector),
+                   model=embedder.MODEL_TAG)
+    return sid
 
 
 async def test_search_returns_nearest_symbol(conn, monkeypatch):
-    _add_symbol(conn, 1, "koffie", [1.0, 0.0, 0.0])
-    _add_symbol(conn, 2, "thee", [0.0, 1.0, 0.0])
+    _add_symbol(conn, "koffie", [1.0, 0.0, 0.0])
+    _add_symbol(conn, "thee", [0.0, 1.0, 0.0])
 
-    async def fake_embed(text, kind):
+    def fake_embed(texts, kind):              # sync, matches seeding embedder
         assert kind == "query"
-        return [0.9, 0.1, 0.0]            # closest to "koffie"
+        return [[0.9, 0.1, 0.0]]
 
     monkeypatch.setattr(embedder, "embed", fake_embed)
     matches = await symbol_search.search(conn, "koffie alstublieft", k=1, lang="nl")
     assert len(matches) == 1
-    assert matches[0].label == "koffie"
-    assert matches[0].score > 0.9
+    assert matches[0].label == "koffie" and matches[0].score > 0.9
 
 
 async def test_search_respects_language_filter(conn, monkeypatch):
-    _add_symbol(conn, 1, "koffie", [1.0, 0.0, 0.0], lang="nl")
-    _add_symbol(conn, 2, "coffee", [1.0, 0.0, 0.0], lang="en")
+    _add_symbol(conn, "koffie", [1.0, 0.0, 0.0], lang="nl")
+    _add_symbol(conn, "coffee", [1.0, 0.0, 0.0], lang="en")
 
-    async def fake_embed(text, kind):
-        return [1.0, 0.0, 0.0]
+    def fake_embed(texts, kind):
+        return [[1.0, 0.0, 0.0]]
 
     monkeypatch.setattr(embedder, "embed", fake_embed)
     matches = await symbol_search.search(conn, "coffee", k=5, lang="en")
@@ -1323,14 +1198,16 @@ async def test_search_respects_language_filter(conn, monkeypatch):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_symbol_search.py -v`
-Expected: FAIL — `No module named 'app.symbol_search'`
+Expected: FAIL — `No module named 'symbol_search'`
 
-- [ ] **Step 3: Write `app/symbol_search.py`**
+- [ ] **Step 3: Write `symbol_search.py`**
 
 ```python
+import asyncio
 import numpy as np
-from app import embedder, db
-from app.models import Match
+import db
+import embedder
+from models import Match
 
 
 def _cosine(query: np.ndarray, matrix: np.ndarray) -> np.ndarray:
@@ -1347,8 +1224,11 @@ async def search(conn, text: str, k: int, lang: str) -> list[Match]:
     if not rows:
         return []
 
-    query_vec = np.asarray(await embedder.embed(text, kind="query"), dtype=np.float32)
-    matrix = np.vstack([db.blob_to_vec(r["vector"]) for r in rows])
+    # embedder.embed is synchronous (seeding plan); keep the event loop free.
+    vectors = await asyncio.to_thread(embedder.embed, [text], "query")
+    query_vec = np.asarray(vectors[0], dtype=np.float32)
+    matrix = np.vstack([np.asarray(db.unpack_vector(r["vector"]), dtype=np.float32)
+                        for r in rows])
     scores = _cosine(query_vec, matrix)
 
     order = np.argsort(scores)[::-1][:k]
@@ -1365,8 +1245,8 @@ Expected: PASS (2 tests)
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app/symbol_search.py tests/test_symbol_search.py
-git commit -m "feat: cosine top-k symbol search over per-language vectors"
+git add symbol_search.py tests/test_symbol_search.py
+git commit -m "feat: cosine top-k symbol search over seeded per-language vectors"
 ```
 
 ---
@@ -1374,42 +1254,42 @@ git commit -m "feat: cosine top-k symbol search over per-language vectors"
 ## Task 12: Translator
 
 **Files:**
-- Create: `app/translator.py`
+- Create: `translator.py`
 - Test: `tests/test_translator.py`
 
 **Interfaces:**
-- Consumes: `app.symbol_search.search`, `app.openrouter.chat`, `app.config.MODEL_LLM`, `app.models.{SymbolCard}`.
+- Consumes: `symbol_search.search`, `openrouter.chat`, `config.MODEL_LLM`, `models.SymbolCard`.
 - Produces (async):
   - `to_symbols(conn, glosses: list[str], lang: str, threshold: float) -> list[SymbolCard]` — best symbol per gloss; below `threshold` → `as_text=True` card with `image_url=None`.
-  - `glossify(text: str, lang: str) -> list[str]` — LLM decomposition of free text into core glosses (dev/`/translate` only).
+  - `glossify(text: str, lang: str) -> list[str]` — LLM decomposition (dev/`/translate` only).
   - `image_url_for(image_path: str) -> str` — `"/media/" + basename`.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-from app import translator, symbol_search, openrouter
-from app.models import Match
+import translator
+import symbol_search
+import openrouter
+from models import Match
 
 
 async def test_to_symbols_picks_best_above_threshold(conn, monkeypatch):
     async def fake_search(connection, text, k, lang):
-        return [Match(symbol_id=7, label=text, image_path=f"/abs/{text}.png", score=0.8)]
+        return [Match(symbol_id=7, label=text, image_path=f"media/{text}.png", score=0.8)]
 
     monkeypatch.setattr(symbol_search, "search", fake_search)
     cards = await translator.to_symbols(conn, ["koffie"], lang="nl", threshold=0.3)
-    assert cards[0].id == 7
-    assert cards[0].as_text is False
+    assert cards[0].id == 7 and cards[0].as_text is False
     assert cards[0].image_url == "/media/koffie.png"
 
 
 async def test_to_symbols_below_threshold_renders_text(conn, monkeypatch):
     async def fake_search(connection, text, k, lang):
-        return [Match(symbol_id=7, label="koffie", image_path="/abs/koffie.png", score=0.1)]
+        return [Match(symbol_id=7, label="koffie", image_path="media/koffie.png", score=0.1)]
 
     monkeypatch.setattr(symbol_search, "search", fake_search)
     cards = await translator.to_symbols(conn, ["koffie"], lang="nl", threshold=0.3)
-    assert cards[0].as_text is True
-    assert cards[0].image_url is None
+    assert cards[0].as_text is True and cards[0].image_url is None
     assert cards[0].label == "koffie"
 
 
@@ -1424,15 +1304,17 @@ async def test_glossify_returns_core_words(monkeypatch):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_translator.py -v`
-Expected: FAIL — `No module named 'app.translator'`
+Expected: FAIL — `No module named 'translator'`
 
-- [ ] **Step 3: Write `app/translator.py`**
+- [ ] **Step 3: Write `translator.py`**
 
 ```python
 import json
 from pathlib import PurePath
-from app import symbol_search, openrouter, config
-from app.models import SymbolCard
+import symbol_search
+import openrouter
+import config
+from models import SymbolCard
 
 _GLOSSIFY_SYSTEM = (
     "Break the text into telegraphic core content words (glosses) for AAC symbol "
@@ -1479,167 +1361,40 @@ Expected: PASS (3 tests)
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app/translator.py tests/test_translator.py
+git add translator.py tests/test_translator.py
 git commit -m "feat: translator maps glosses to symbols with threshold + glossify"
 ```
 
 ---
 
-## Task 13: Offline indexing pipeline
+## Task 13: REMOVED
 
-**Files:**
-- Create: `indexing/__init__.py` (empty)
-- Create: `indexing/import_arasaac.py`
-- Create: `indexing/enrich.py`
-- Create: `indexing/build_index.py`
-- Test: `tests/test_indexing.py`
-
-**Interfaces:**
-- Consumes: `app.db`, `app.embedder.embed_many`, `app.openrouter.chat`, `app.config`.
-- Produces:
-  - `import_arasaac.insert_symbol(conn, external_id, image_path, keyword, lang, is_core=False) -> int` — upserts a `symbols` row and a `symbol_terms` row (description seeded to the keyword, empty vector placeholder).
-  - `enrich.enrich_description(keyword, lang) -> str` (async) — one LLM pass expanding a keyword into a richer description.
-  - `build_index.build(conn, lang) -> int` (async) — embeds every `symbol_terms.description` for `lang` with the `passage` prefix, writes `vector` + `model`; returns count.
-
-(The ARASAAC network fetch is a thin `main()` not unit-tested; the unit tests cover `insert_symbol`, `enrich_description`, and `build`.)
-
-- [ ] **Step 1: Write the failing test**
-
-```python
-import numpy as np
-from app import db, embedder, openrouter
-from indexing import import_arasaac, enrich, build_index
-
-
-async def test_insert_then_build_index_writes_vectors(conn, monkeypatch):
-    sid = import_arasaac.insert_symbol(conn, external_id="123",
-                                       image_path="koffie.png", keyword="koffie", lang="nl")
-    assert sid > 0
-
-    async def fake_embed_many(texts, kind):
-        assert kind == "passage"
-        return [[0.5] * 1024 for _ in texts]
-
-    monkeypatch.setattr(embedder, "embed_many", fake_embed_many)
-    count = await build_index.build(conn, lang="nl")
-    assert count == 1
-    row = conn.execute("SELECT vector, model FROM symbol_terms WHERE symbol_id = ?",
-                       (sid,)).fetchone()
-    assert db.blob_to_vec(row["vector"]).shape == (1024,)
-    assert row["model"] == "intfloat/multilingual-e5-large"
-
-
-async def test_enrich_description_calls_llm(monkeypatch):
-    async def fake_chat(messages, model, temperature=0.7, response_format=None):
-        return "meer, nog een, extra, ik wil nog"
-
-    monkeypatch.setattr(openrouter, "chat", fake_chat)
-    out = await enrich.enrich_description("meer", "nl")
-    assert "extra" in out
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `pytest tests/test_indexing.py -v`
-Expected: FAIL — `No module named 'indexing'`
-
-- [ ] **Step 3: Write the three modules**
-
-`indexing/import_arasaac.py`:
-```python
-from datetime import datetime, timezone
-from app import db, config
-
-
-def insert_symbol(conn, external_id, image_path, keyword, lang, is_core=False) -> int:
-    cursor = conn.execute(
-        "INSERT INTO symbols(source, external_id, image_path, is_core, created_at) "
-        "VALUES ('arasaac', ?, ?, ?, ?)",
-        (external_id, image_path, int(is_core),
-         datetime.now(timezone.utc).isoformat()))
-    symbol_id = cursor.lastrowid
-    conn.execute(
-        "INSERT INTO symbol_terms(symbol_id, lang, label, description, vector, model) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (symbol_id, lang, keyword, keyword,
-         db.vec_to_blob([0.0] * config.EMBED_DIM), ""))   # vector filled by build_index
-    conn.commit()
-    return symbol_id
-
-
-# main(): fetch ARASAAC pictographs + nl/en keywords, download images to MEDIA_DIR,
-# call insert_symbol per pictograph. Network-bound; run manually, not unit-tested.
-```
-
-`indexing/enrich.py`:
-```python
-from app import openrouter, config
-
-_SYSTEM = ("Expand the AAC keyword into a short comma-separated description of "
-           "related words and a typical phrase, same language. Plain text only.")
-
-
-async def enrich_description(keyword: str, lang: str) -> str:
-    messages = [
-        {"role": "system", "content": _SYSTEM},
-        {"role": "user", "content": f"Language: {lang}\nKeyword: {keyword}"},
-    ]
-    return await openrouter.chat(messages, model=config.MODEL_LLM)
-```
-
-`indexing/build_index.py`:
-```python
-from app import db, embedder, config
-
-
-async def build(conn, lang: str) -> int:
-    rows = conn.execute(
-        "SELECT symbol_id, description FROM symbol_terms WHERE lang = ?", (lang,)).fetchall()
-    if not rows:
-        return 0
-    vectors = await embedder.embed_many([r["description"] for r in rows], kind="passage")
-    for row, vector in zip(rows, vectors):
-        conn.execute(
-            "UPDATE symbol_terms SET vector = ?, model = ? WHERE symbol_id = ? AND lang = ?",
-            (db.vec_to_blob(vector), config.MODEL_EMBED, row["symbol_id"], lang))
-    conn.commit()
-    return len(rows)
-```
-
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `pytest tests/test_indexing.py -v`
-Expected: PASS (2 tests)
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add indexing/ tests/test_indexing.py
-git commit -m "feat: offline indexing — import, enrich, build embeddings"
-```
+The offline ARASAAC import/seed/embed pipeline is owned entirely by the ARASAAC seeding plan (`indexing/arasaac.py`, `indexing/describe.py`, `indexing/seed.py`, `indexing/core_words.txt`). Run `python -m indexing.seed` to populate the dictionary before exercising the live path.
 
 ---
 
 ## Task 14: API + orchestration (REST + WebSocket)
 
 **Files:**
-- Create: `app/api.py`
-- Create: `app/main.py`
+- Create: `api.py`
+- Create: `main.py`
 - Test: `tests/test_api.py`
 
 **Interfaces:**
-- Consumes: `app.{persona, option_generator, translator, transcriber, audio_stream, vad, utterance, db}`, `app.models.Option`.
+- Consumes: `db` (seeding, for connect + symbol schema), `store` (live schema + settings), `persona`, `option_generator`, `translator`, `transcriber`, `audio_stream`, `vad`, `utterance`, `config`, `models.Option`.
 - Produces:
-  - `propose(conn, *, context_text, lang, context_type, audio_path=None, asr_model=None) -> dict` — shared orchestration: persona + history → option_generator → translator → persist interaction + options → `{"interaction_id": int, "options": [Option...]}`.
-  - FastAPI `app` with routes: `POST /expressive/options` (dev), `POST /expressive/select`, `POST /translate`, `WS /expressive/listen`, and `/media/*` static mount.
+  - `propose(conn, *, context_text, lang, context_type, audio_path=None, asr_model=None) -> dict` — shared orchestration → `{"interaction_id": int, "options": [Option...]}`.
+  - FastAPI `app`: `POST /expressive/options` (dev), `POST /expressive/select`, `POST /translate`, `WS /expressive/listen`, `/media/*` static mount.
 
-- [ ] **Step 1: Write the failing test for the dev propose path** (fakes for LLM + symbol search)
+- [ ] **Step 1: Write the failing test for the dev propose path**
 
 ```python
 import pytest
 from fastapi.testclient import TestClient
-from app import api, option_generator, translator
-from app.models import Candidate, SymbolCard
+import api
+import option_generator
+import translator
+from models import Candidate, SymbolCard
 
 
 @pytest.fixture
@@ -1683,31 +1438,38 @@ def test_select_unknown_returns_404(client):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_api.py -v`
-Expected: FAIL — `No module named 'app.api'`
+Expected: FAIL — `No module named 'api'`
 
-- [ ] **Step 3: Write `app/api.py`**
+- [ ] **Step 3: Write `api.py`**
 
 ```python
 import json
+import sqlite3
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from app import (db, persona, option_generator, translator, transcriber,
-                 utterance, config)
-from app.audio_stream import Segmenter
-from app.vad import EnergyDetector
-from app.models import Option, SymbolCard
+
+import db
+import store
+import persona
+import option_generator
+import translator
+import transcriber
+import utterance
+import config
+from audio_stream import Segmenter
+from vad import EnergyDetector
+from models import Option
 
 app = FastAPI()
 
 
 def _open_conn():
-    connection = db.connect() if hasattr(db, "connect") else None
-    import sqlite3
     connection = sqlite3.connect(config.DB_PATH)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    db.init_db(connection)
+    db.create_schema(connection)        # symbols + symbol_terms (seeding plan)
+    store.create_schema(connection)     # interactions/options/persona/settings
     return connection
 
 
@@ -1730,8 +1492,8 @@ async def propose(conn, *, context_text, lang, context_type,
                   audio_path=None, asr_model=None) -> dict:
     who = persona.load(conn)
     history = persona.recent(conn, n=5)
-    n = int(db.get_setting(conn, "option_count"))
-    threshold = float(db.get_setting(conn, "match_threshold"))
+    n = int(store.get_setting(conn, "option_count"))
+    threshold = float(store.get_setting(conn, "match_threshold"))
     candidates = await option_generator.generate(context_text, who, history, n, lang)
 
     interaction_id = persona.log_interaction(
@@ -1753,14 +1515,14 @@ async def propose(conn, *, context_text, lang, context_type,
 @app.post("/expressive/options")
 async def expressive_options(body: OptionsIn):
     conn = _open_conn()
-    lang = body.lang or db.get_setting(conn, "lang")
+    lang = body.lang or store.get_setting(conn, "lang")
     return await propose(conn, context_text=body.text, lang=lang, context_type="text")
 
 
 @app.post("/expressive/select")
 async def expressive_select(body: SelectIn):
     conn = _open_conn()
-    lang = db.get_setting(conn, "lang")
+    lang = store.get_setting(conn, "lang")
     try:
         text = persona.mark_selected(conn, body.interaction_id, body.option_id)
     except KeyError:
@@ -1772,8 +1534,8 @@ async def expressive_select(body: SelectIn):
 @app.post("/translate")
 async def translate(body: TranslateIn):
     conn = _open_conn()
-    lang = body.lang or db.get_setting(conn, "lang")
-    threshold = float(db.get_setting(conn, "match_threshold"))
+    lang = body.lang or store.get_setting(conn, "lang")
+    threshold = float(store.get_setting(conn, "match_threshold"))
     glosses = await translator.glossify(body.text, lang)
     cards = await translator.to_symbols(conn, glosses, lang, threshold)
     return {"glosses": glosses, "symbols": [c.model_dump() for c in cards]}
@@ -1783,8 +1545,8 @@ async def translate(body: TranslateIn):
 async def listen(ws: WebSocket):
     await ws.accept()
     conn = _open_conn()
-    lang = db.get_setting(conn, "lang")
-    silence_ms = int(db.get_setting(conn, "vad_silence_ms"))
+    lang = store.get_setting(conn, "lang")
+    silence_ms = int(store.get_setting(conn, "vad_silence_ms"))
     segmenter = Segmenter(EnergyDetector(), silence_ms=silence_ms)
     muted = False
     try:
@@ -1825,11 +1587,11 @@ config.MEDIA_DIR.mkdir(exist_ok=True)
 app.mount("/media", StaticFiles(directory=str(config.MEDIA_DIR)), name="media")
 ```
 
-- [ ] **Step 4: Write `app/main.py`** (uvicorn entry + front-end mount)
+- [ ] **Step 4: Write `main.py`** (uvicorn entry + front-end mount)
 
 ```python
 from fastapi.staticfiles import StaticFiles
-from app.api import app
+from api import app
 
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
@@ -1846,7 +1608,7 @@ Expected: PASS (2 tests)
 - [ ] **Step 6: Commit**
 
 ```bash
-git add app/api.py app/main.py tests/test_api.py
+git add api.py main.py tests/test_api.py
 git commit -m "feat: API orchestration — options, select, translate, WS listen"
 ```
 
@@ -1858,15 +1620,19 @@ git commit -m "feat: API orchestration — options, select, translate, WS listen
 - Test: `tests/test_integration.py`
 
 **Interfaces:**
-- Consumes: the full app with fakes for the three OpenRouter calls and a fake VAD via scripted frames.
+- Consumes: the full app with fakes for ASR + LLM + symbol search; scripted audio frames.
 
-- [ ] **Step 1: Write the WebSocket integration test** (audio frames → options pushed; fakes for ASR + LLM + search)
+- [ ] **Step 1: Write the WebSocket integration test**
 
 ```python
 import pytest
 from fastapi.testclient import TestClient
-from app import api, transcriber, option_generator, translator, db
-from app.models import Transcript, Candidate, SymbolCard
+import api
+import transcriber
+import option_generator
+import translator
+import store
+from models import Transcript, Candidate, SymbolCard
 
 VOICE = b"\x10\x00" * 320
 SILENCE = b"\x00\x00" * 320
@@ -1889,8 +1655,7 @@ def client(conn, monkeypatch):
     monkeypatch.setattr(transcriber, "transcribe", fake_transcribe)
     monkeypatch.setattr(option_generator, "generate", fake_generate)
     monkeypatch.setattr(translator, "to_symbols", fake_to_symbols)
-    # EnergyDetector treats VOICE as speech, SILENCE as silence.
-    db.set_setting(conn, "vad_silence_ms", "40")
+    store.set_setting(conn, "vad_silence_ms", "40")   # 2 silent frames end a turn
     return TestClient(api.app)
 
 
@@ -1899,7 +1664,7 @@ def test_audio_stream_yields_options(client):
         websocket.send_bytes(VOICE)
         websocket.send_bytes(VOICE)
         websocket.send_bytes(SILENCE)
-        websocket.send_bytes(SILENCE)            # endpoint → triggers propose
+        websocket.send_bytes(SILENCE)            # endpoint → propose
         event = websocket.receive_json()
     assert event["type"] == "utterance"
     assert event["transcript"] == "wil je koffie?"
@@ -1924,7 +1689,7 @@ def test_mute_marker_suppresses_options(client):
 - [ ] **Step 2: Run tests to verify they pass**
 
 Run: `pytest tests/test_integration.py -v`
-Expected: PASS (2 tests). If the energy threshold rejects `VOICE`, lower `EnergyDetector` threshold or raise the VOICE amplitude in the fixture until `feed(VOICE)` is detected as speech.
+Expected: PASS (2 tests). If `EnergyDetector` rejects `VOICE`, raise the VOICE amplitude in the fixture until `feed(VOICE)` is detected as speech.
 
 - [ ] **Step 3: Commit**
 
@@ -1938,20 +1703,15 @@ git commit -m "test: end-to-end WS audio→options with mute suppression"
 ## Task 16: Front-end integration
 
 **Files:**
-- Create: `frontend/index.html`
-- Create: `frontend/styles.css`
-- Create: `frontend/src/pcm-worklet.js`
-- Create: `frontend/src/audio-capture.js`
-- Create: `frontend/src/ws-client.js`
-- Create: `frontend/src/tts.js`
-- Create: `frontend/src/app.js`
+- Create: `frontend/index.html`, `frontend/styles.css`
+- Create: `frontend/src/pcm-worklet.js`, `frontend/src/audio-capture.js`, `frontend/src/ws-client.js`, `frontend/src/tts.js`, `frontend/src/app.js`
 - Test (smoke, manual/Playwright): `frontend/test/smoke.spec.js`
 
 **Interfaces:**
 - Consumes: T6 utilities (`downsampleTo16k`, `EchoGate`, `DwellSelector`); the API contract from T14.
 - Produces: the running UI — mic capture → WS frames; render option rows of large symbol cards; dwell-select → `POST /expressive/select` → speak via `SpeechSynthesis`, with the echo gate muting the mic during playback.
 
-- [ ] **Step 1: Write `frontend/src/tts.js`** (speak + drive the echo gate and a mute callback)
+- [ ] **Step 1: Write `frontend/src/tts.js`**
 
 ```javascript
 import { EchoGate } from "./echo-gate.js";
@@ -1990,7 +1750,7 @@ export function connectListen({ onUtterance }) {
 }
 ```
 
-- [ ] **Step 3: Write `frontend/src/pcm-worklet.js`** (forwards raw Float32 frames to the main thread)
+- [ ] **Step 3: Write `frontend/src/pcm-worklet.js`**
 
 ```javascript
 class PcmWorklet extends AudioWorkletProcessor {
@@ -2025,7 +1785,7 @@ export async function startCapture({ onFrame, isMuted }) {
 }
 ```
 
-- [ ] **Step 5: Write `frontend/src/app.js`** (wire everything)
+- [ ] **Step 5: Write `frontend/src/app.js`**
 
 ```javascript
 import { connectListen } from "./ws-client.js";
@@ -2053,7 +1813,6 @@ function renderOptions(message) {
     const row = document.createElement("button");
     row.className = "option";
     row.dataset.optionId = option.option_id;
-    row.dataset.text = option.text;
     row.onmouseenter = () => selector.enter(String(option.option_id));
     row.onmouseleave = () => selector.leave();
     row.onclick = () => choose(String(option.option_id));
@@ -2116,11 +1875,11 @@ main { padding: 2rem; }
 .card .text { font-weight: 700; }
 ```
 
-- [ ] **Step 7: Write the smoke test** (Playwright; document that it needs the server running with a fake)
+- [ ] **Step 7: Write the smoke test**
 
 `frontend/test/smoke.spec.js`:
 ```javascript
-// Smoke test — run against `python -m app.main` with stubbed OpenRouter calls.
+// Smoke test — run against `python main.py` with stubbed OpenRouter calls.
 // Verifies the option grid renders and selecting speaks. Not a unit test; this
 // exercises real WS + DOM. Marked manual in CI until a fake-backed fixture exists.
 import { test, expect } from "@playwright/test";
@@ -2128,26 +1887,24 @@ import { test, expect } from "@playwright/test";
 test("renders options and selects one", async ({ page }) => {
   await page.goto("http://127.0.0.1:8000/");
   await expect(page.locator("h1")).toHaveText("Kies een antwoord");
-  // With a seeded utterance pushed over the WS, an .option appears and is clickable.
-  // (Requires the dev harness from the run checklist below.)
 });
 ```
 
-- [ ] **Step 8: Manual verification checklist** (TDD is impractical for getUserMedia/WS in CI — verify by hand)
+- [ ] **Step 8: Manual verification checklist** (TDD is impractical for getUserMedia/WS in CI)
 
 ```
-1. Seed a tiny DB + index (Task 13 main, or a fixture) and set OPENROUTER_API_KEY.
-2. Run: python -m app.main
+1. Seed the dictionary: python -m indexing.seed   (seeding plan)
+2. Set OPENROUTER_API_KEY. Run: python main.py
 3. Open http://127.0.0.1:8000/ , grant mic permission.
 4. Speak a Dutch sentence; confirm option rows of symbol cards appear.
-5. Dwell on one; confirm it is spoken and the mic icon mutes during playback.
+5. Dwell on one; confirm it is spoken and the mic mutes during playback.
 6. Confirm the spoken reply does NOT produce a new option set (echo guard works).
 ```
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add frontend/index.html frontend/styles.css frontend/src tests
+git add frontend/index.html frontend/styles.css frontend/src frontend/test
 git commit -m "feat: front-end — mic capture, options grid, dwell-select, TTS echo guard"
 ```
 
@@ -2160,8 +1917,8 @@ git commit -m "feat: front-end — mic capture, options grid, dwell-select, TTS 
 - Test: `tests/test_retrieval_eval.py`
 
 **Interfaces:**
-- Consumes: `app.symbol_search.search`, `app.db`.
-- Produces: a recall@k measurement over curated `query → expected symbol` pairs; the primary tuning signal for descriptions, threshold, and `k`.
+- Consumes: `symbol_search.search`, seeding `db`/`embedder`.
+- Produces: a recall@k measurement over curated `query → expected symbol` pairs.
 
 - [ ] **Step 1: Write the fixture**
 
@@ -2174,19 +1931,18 @@ git commit -m "feat: front-end — mic capture, options grid, dwell-select, TTS 
 ]
 ```
 
-- [ ] **Step 2: Write the eval test** (deterministic: seed known vectors so recall is exercised without network)
+- [ ] **Step 2: Write the eval test** (deterministic — seed known vectors via the seeding `db` writers)
 
 ```python
 import json
 from pathlib import Path
-import numpy as np
-from app import symbol_search, embedder, db
+import symbol_search
+import embedder
+import db
 
 FIXTURE = Path(__file__).parent / "fixtures" / "recall_set.json"
 
-_VECTORS = {
-    "koffie": [1.0, 0.0, 0.0], "meer": [0.0, 1.0, 0.0], "coffee": [1.0, 0.0, 0.0],
-}
+_VECTORS = {"koffie": [1.0, 0.0, 0.0], "meer": [0.0, 1.0, 0.0], "coffee": [1.0, 0.0, 0.0]}
 _QUERY_VECTORS = {
     "ik wil koffie": [0.95, 0.05, 0.0], "nog een keer": [0.0, 0.98, 0.02],
     "i want coffee": [0.97, 0.0, 0.0],
@@ -2194,21 +1950,19 @@ _QUERY_VECTORS = {
 
 
 def _seed(conn):
-    for i, (label, vec) in enumerate(_VECTORS.items(), start=1):
+    for label, vec in _VECTORS.items():
         lang = "en" if label == "coffee" else "nl"
-        conn.execute("INSERT INTO symbols(id, source, image_path, created_at) "
-                     "VALUES (?, 'arasaac', ?, '2026-06-21')", (i, f"{label}.png"))
-        conn.execute("INSERT INTO symbol_terms(symbol_id, lang, label, description, vector, model) "
-                     "VALUES (?, ?, ?, ?, ?, 'm')",
-                     (i, lang, label, label, db.vec_to_blob(vec)))
-    conn.commit()
+        sid = db.insert_symbol(conn, source="arasaac", external_id=label,
+                               image_path=f"media/{label}.png", is_core=1, created_at="t0")
+        db.insert_term(conn, symbol_id=sid, lang=lang, label=label, description=label,
+                       vector=db.pack_vector(vec), model=embedder.MODEL_TAG)
 
 
 async def test_recall_at_1_is_perfect_on_fixture(conn, monkeypatch):
     _seed(conn)
 
-    async def fake_embed(text, kind):
-        return _QUERY_VECTORS[text]
+    def fake_embed(texts, kind):
+        return [_QUERY_VECTORS[texts[0]]]
 
     monkeypatch.setattr(embedder, "embed", fake_embed)
 
@@ -2218,8 +1972,7 @@ async def test_recall_at_1_is_perfect_on_fixture(conn, monkeypatch):
         matches = await symbol_search.search(conn, case["query"], k=1, lang=case["lang"])
         if matches and matches[0].label == case["expected_label"]:
             hits += 1
-    recall_at_1 = hits / len(cases)
-    assert recall_at_1 == 1.0          # tighten/extend the fixture as real vectors land
+    assert hits / len(cases) == 1.0          # tighten/extend the fixture as real vectors land
 ```
 
 - [ ] **Step 3: Run tests to verify they pass**
@@ -2236,30 +1989,31 @@ git commit -m "test: recall@k retrieval eval harness with seed fixture"
 
 ---
 
-## Self-Review (completed against the spec)
+## Self-Review (completed against both specs)
 
 **Spec coverage:**
-- §5 modules — every module maps to a task: audio_stream→T4, transcriber→T9, embedder→T8, symbol_search→T11, translator→T12, option_generator→T10, utterance→T5, persona→T7, api→T14, indexing→T13. ✓
-- §6 data model — all six tables created in T2; `context_audio_path`/`asr_model` plumbed in T7/T14. ✓
-- §7 endpoints — WS `/expressive/listen` (T14), `/expressive/select` (T14), dev `/expressive/options` (T14), `/translate` (T14). ✓
-- §8 data flow — covered by the T15 WS test. ✓
-- §9 services — one OpenRouter client (T3) for ASR/LLM/embeddings; no second vendor. ✓
-- §10 indexing — T13. ✓
+- Audio→symbol spec §5 modules — audio_stream→T4, transcriber→T9, symbol_search→T11, translator→T12, option_generator→T10, utterance→T5, persona→T7, api→T14. Embedder + indexing → seeding plan (T8/T13 removed). ✓
+- §6 data model — `symbols`/`symbol_terms` owned by seeding `db.py`; `interactions`/`options`/`persona`/`settings` created idempotently by `store.py` (T2). `context_audio_path`/`asr_model` plumbed in T7/T14. ✓
+- §7 endpoints — all four routes in T14. ✓
+- §8 data flow — T15 WS test. ✓
+- §9 services — one OpenRouter key: chat/transcribe via `openrouter.py` (T3), embeddings via seeding `embedder.py`. ✓
+- §10 indexing — seeding plan. ✓
 - §11 errors — empty transcript skipped (T14), unknown selection → 404 (T14), TTS echo guard (mute markers T14 + EchoGate T6 + capture gate T16). ✓
-- §12 testing — unit tests per module; integration T15; recall@k T17. ✓
-- §13 stack / §3 decisions — pins, models, dims, VAD, prefixes all in T1 + relevant tasks. ✓
+- §12 testing — unit per module; integration T15; recall@k T17. ✓
+- §13 stack / §3 decisions — repo-root layout, model ids, dims, VAD, prefixes consistent with the seeding plan. ✓
+- **Idempotency (the requested change):** `store.create_schema` uses `IF NOT EXISTS` + `INSERT OR IGNORE` (T2 has an explicit idempotency test); symbol rows in tests use the seeding `db.insert_symbol`/`insert_term` (idempotent via `external_id UNIQUE`); `_open_conn` re-runs both `create_schema`s safely on every request. ✓
 
-**Placeholder scan:** no "TBD"/"handle edge cases"/"similar to Task N" — every code step contains real code. The only non-code verifications are the front-end manual checklist (T16) and the Playwright smoke (honestly flagged, because getUserMedia/WS cannot be unit-tested deterministically). ✓
+**Placeholder scan:** every code step contains real, runnable code — no TBD/TODO/"handle edge cases". The only non-code verifications are the T16 manual checklist and Playwright smoke (honestly flagged — getUserMedia/WS cannot be unit-tested deterministically). ✓
 
-**Type consistency:** `Match(symbol_id,label,image_path,score)`, `SymbolCard(id,label,image_url,confidence,as_text)`, `Candidate(text,glosses)`, `Option(option_id,text,symbols)`, `Transcript(text,lang)`, `Segment(pcm,sample_rate)` are used identically across producers (T11/T12/T10/T14) and consumers. `propose()` and `to_symbols(conn,...)` signatures match their call sites in T14/T15. ✓
+**Type consistency:** `Match(symbol_id,label,image_path,score)`, `SymbolCard(id,label,image_url,confidence,as_text)`, `Candidate(text,glosses)`, `Option(option_id,text,symbols)`, `Transcript(text,lang)`, `Segment(pcm,sample_rate)` used identically across producers/consumers. `embedder.embed(texts, kind)` is called **synchronously** (wrapped in `asyncio.to_thread` in T11) matching the seeding plan's signature. `store.get_setting`/`db.unpack_vector`/`db.insert_*` names match their definitions in the seeding plan. ✓
 
 ---
 
 ## Execution Handoff
 
-**Plan complete and saved to `docs/2026-06-21-audio-symbol-translator-implementation-plan.md`. Two execution options:**
+**Plan complete and saved to `docs/2026-06-21-audio-symbol-translator-implementation-plan.md`. It depends on the ARASAAC seeding plan for `db.py`, `embedder.py`, and `indexing/` — run/merge that plan's Tasks 1–4 before this plan's Wave 3 (T11). Two execution options:**
 
-**1. Subagent-Driven (recommended)** — I dispatch a fresh subagent per task, review between tasks, fast iteration. To exploit the wave structure, dispatch all tasks in a wave concurrently (superpowers:dispatching-parallel-agents), review, then barrier before the next wave.
+**1. Subagent-Driven (recommended)** — I dispatch a fresh subagent per task, review between tasks, fast iteration. To exploit the waves, dispatch all tasks in a wave concurrently (superpowers:dispatching-parallel-agents), review, then barrier before the next wave.
 
 **2. Inline Execution** — Execute tasks in this session using executing-plans, batch execution with checkpoints for review.
 
