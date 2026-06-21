@@ -70,7 +70,7 @@ proposed responses as symbols), not a reading channel for her.
 | Audio transport | WebSocket; 16 kHz mono PCM16 frames | Low-latency push of audio in and options out, one connection |
 | Translation core | Embedding similarity search | Maps meaning → symbols robustly |
 | Embedder | OpenAI `text-embedding-3-small` | Best accuracy for short-phrase nuance; cheap; multilingual |
-| Option generation | Claude (text-only) | Fluent Dutch; vision no longer needed |
+| Option generation | GLM-5.2 (`z-ai/glm-5.2`) via OpenRouter | Strong multilingual reasoning; text-only; shares the OpenRouter key with ASR |
 | Symbol set | ARASAAC (open) + custom | Free, ~13k pictographs, multilingual keywords |
 | Vector store | SQLite (`sqlite-vec`; numpy-blob fallback) | ~13k symbols is trivial; stays in our stack |
 | Language | Dutch primary, English supported | One `lang` setting threads through the stack |
@@ -109,7 +109,7 @@ and the backend pushes symbol options back over the same WebSocket.
 │         ▼                                                                        │
 │  ┌───────────────┐  utterance  ┌──────────────┐  text  ┌─────────────────┐      │
 │  │ AudioSegmenter│────audio───►│  Transcriber │───────►│ OptionGenerator  │     │
-│  │ (VAD endpoint)│             │  (Parakeet)  │        │  (Claude, text)  │     │
+│  │ (VAD endpoint)│             │  (Parakeet)  │        │   (GLM-5.2 LLM)  │     │
 │  └───────────────┘             └──────────────┘        └────────┬─────────┘     │
 │                                              N × {text, glosses[]}│              │
 │                                                                   ▼              │
@@ -128,7 +128,7 @@ and the backend pushes symbol options back over the same WebSocket.
 │   symbols · symbol_terms(label,description,vector,lang) · persona ·            │
 │   interactions · options · settings   media/ (symbol PNGs, utterance audio)    │
 └──────────────────────────────────────────────────────────────────────────────┘
-   External: OpenRouter (Parakeet ASR) · Claude API (text) · OpenAI embeddings · browser TTS · ARASAAC (import only)
+   External: OpenRouter (Parakeet ASR + GLM-5.2 LLM) · OpenAI embeddings · browser TTS · ARASAAC (import only)
 
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  OFFLINE INDEXING PIPELINE (run once / on vocab change — NOT in the live path)  │
@@ -232,7 +232,7 @@ means re-indexing. Per-language rows let a Dutch query match Dutch descriptions
 directly (strictly more accurate than cross-lingual matching, at negligible
 cost). `settings.lang` is the single source of truth for the active language;
 it selects the ARASAAC locale, which `symbol_terms` rows to search, the language
-Parakeet transcribes in, the language Claude writes in, and the TTS voice.
+Parakeet transcribes in, the language GLM-5.2 writes in, and the TTS voice.
 `vad_silence_ms` is how long a pause counts as the end of an utterance; it is the
 main knob for turn-taking feel.
 
@@ -248,7 +248,7 @@ otherwise an internal service.
 - **Per connection, the server:** feeds frames to `AudioSegmenter`; on a silence
   endpoint it takes the buffered utterance audio → `Transcriber.transcribe` →
   if the transcript is non-empty, load persona + recent picks →
-  `OptionGenerator.generate` (Claude) → for each candidate
+  `OptionGenerator.generate` (GLM-5.2) → for each candidate
   `Translator.to_symbols(glosses)` → persist one `interactions` row
   (`context_type='audio'`) + N `options` rows → push the result.
 - **Server → client (JSON events):**
@@ -295,7 +295,7 @@ otherwise an internal service.
    `vad_silence_ms`), it closes the utterance and emits its audio.
 4. `Transcriber` sends the utterance audio to Parakeet (OpenRouter) → transcript
    (Dutch/English per `settings.lang`).
-5. The transcript becomes the context: `OptionGenerator` asks Claude for N
+5. The transcript becomes the context: `OptionGenerator` asks GLM-5.2 for N
    responses in her voice, grounded in persona + recent picks. Each response
    carries `{ text, glosses }`.
 6. Each gloss is embedded and matched to its best symbol (top-1 above the
@@ -317,16 +317,17 @@ dev/curation) is the only use of text→symbol mapping.
   (audio clip in → text + segment timestamps out), EU-language coverage incl.
   Dutch, $0.0015/min. A self-hosted Parakeet (NeMo) can replace it later behind
   the same interface.
-- **Claude (text)** — option generation. Also used once, offline, to enrich
-  ARASAAC descriptions. No vision is used.
+- **GLM-5.2 (`z-ai/glm-5.2`)** — text-only option generation, and the offline
+  ARASAAC enrichment pass. 1M-token context; $1.20 / $4.10 per 1M tokens;
+  OpenAI-compatible chat completions. Shares the OpenRouter key with Parakeet.
 - **OpenAI `text-embedding-3-small`** — embeddings, 1536 dims, behind the
   `Embedder` interface.
 - **Browser `SpeechSynthesis`** — TTS (`nl-NL` / `en` voices).
 - **ARASAAC** — pictograph images + multilingual keywords, at import time only.
 
-Three vendors / three keys (OpenRouter + Anthropic + OpenAI). Claude and the
-embedder could later be routed through OpenRouter too, collapsing to one key; we
-keep them direct for now (see §14).
+Two vendors / two keys (OpenRouter for ASR + LLM, OpenAI for embeddings). The
+embedder could later move to OpenRouter too — if a compatible embedding model is
+offered — collapsing to a single key; we keep it direct for now (see §14).
 
 ## 10. Offline indexing pipeline
 
@@ -334,7 +335,7 @@ Run once, and again whenever the vocabulary changes. Not in the live path.
 
 1. `import_arasaac` — fetch pictographs + `nl` and `en` keywords; store images
    under `media/`; insert `symbols` rows.
-2. `enrich` — one Claude pass per symbol per language: expand the keyword into a
+2. `enrich` — one GLM-5.2 pass per symbol per language: expand the keyword into a
    richer description ("meer, nog een, extra, ik wil nog") for better recall.
 3. `build_index` — embed each `symbol_terms.description`; write `vector` +
    `model`.
@@ -369,7 +370,7 @@ Run once, and again whenever the vocabulary changes. Not in the live path.
   silences — speech segmented at the right points), `transcriber` (mocked
   OpenRouter → `Transcript`), `embedder` (shape/determinism, mocked API),
   `symbol_search` (expected top-k on a tiny fixture dictionary), `translator`
-  (glosses → sequence; threshold behavior), `option_generator` (mocked Claude →
+  (glosses → sequence; threshold behavior), `option_generator` (mocked LLM →
   valid `{text, glosses}`), `utterance` (compose).
 - **Integration:** fake audio frames → `AudioSegmenter` → fake `Transcriber` →
   real option pipeline → options. The `POST /expressive/options` dev endpoint
@@ -390,8 +391,8 @@ Run once, and again whenever the vocabulary changes. Not in the live path.
   `/v1/audio/transcriptions`); utterance PCM is wrapped as a WAV per request.
 - SQLite with `sqlite-vec` (numpy brute-force cosine as fallback — ~13k symbols
   is <10 ms either way).
-- OpenAI `text-embedding-3-small` (embeddings); Claude (text-only option
-  generation + offline enrichment).
+- OpenAI `text-embedding-3-small` (embeddings); GLM-5.2 via OpenRouter
+  (`z-ai/glm-5.2`, text-only option generation + offline enrichment).
 - Front-end: plain HTML/CSS/JS — a grid of large targets, dwell-to-select,
   browser `SpeechSynthesis` for speech, and `getUserMedia` + an `AudioWorklet`
   to capture the mic, downsample to 16 kHz mono PCM16, and stream frames over the
@@ -406,16 +407,17 @@ Run once, and again whenever the vocabulary changes. Not in the live path.
 - **Language: pin vs. auto-detect:** Parakeet can auto-detect, but pinning to
   `settings.lang` is more predictable for a Dutch-first user. Default to pinned;
   expose auto-detect later if she switches languages mid-conversation.
-- **Vendor consolidation:** routing Claude (and embeddings, if a compatible
-  model exists) through OpenRouter would reduce three keys to one. Deferred;
-  keep direct clients for now.
+- **Vendor consolidation:** ASR and the LLM already share the OpenRouter key.
+  Moving embeddings to OpenRouter too — if a compatible embedding model is
+  offered — would collapse to a single key. Deferred; keep the embedder direct
+  on OpenAI for now.
 - **Persisting utterance audio:** `context_audio_path` lets us replay mis-hears
   and re-run ASR offline; weigh against storage and privacy before enabling by
   default.
 - **Option count:** default 5; expose in `settings`. Eye-gaze favours few, large
   targets — tune with the user.
 - **Privacy:** the partner's speech (audio + transcript) and her words are sent
-  to OpenRouter / Claude / embedding APIs. Acceptable for a prototype; a real
+  to OpenRouter (ASR + LLM) and the OpenAI embedding API. Acceptable for a prototype; a real
   deployment needs a conscious data-handling decision — and is the strongest
   argument for self-hosting Parakeet and a local fallback embedder.
 - **Multi-symbol per gloss:** v1 maps one gloss → one symbol. Some concepts need
