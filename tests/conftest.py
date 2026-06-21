@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 def conn():
     import db        # seeding plan: creates symbols + symbol_terms
     import store     # this plan: creates interactions, options, persona, settings
-    connection = sqlite3.connect(":memory:")
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     db.create_schema(connection)
