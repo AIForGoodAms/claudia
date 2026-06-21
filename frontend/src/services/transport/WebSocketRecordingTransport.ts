@@ -18,6 +18,8 @@ export class WebSocketRecordingTransport implements RecordingTransport {
   private socket: WebSocket | null = null;
   private optionsCb: ((r: OptionsResponse) => void) | null = null;
   private errorCb: ((e: Error) => void) | null = null;
+  /** Set once stop() is called so late open/error events are ignored quietly. */
+  private stopped = false;
 
   constructor(private readonly wsUrl: string) {}
 
@@ -30,15 +32,23 @@ export class WebSocketRecordingTransport implements RecordingTransport {
   }
 
   async start({ lang }: { lang: Lang }): Promise<void> {
+    this.stopped = false;
     await new Promise<void>((resolve, reject) => {
       try {
         // lang is configured server-side; pass it as a hint, harmless if ignored.
         const url = `${this.wsUrl}?lang=${encodeURIComponent(lang)}`;
         const socket = new WebSocket(url);
         socket.binaryType = 'arraybuffer';
-        socket.onopen = () => resolve();
+        socket.onopen = () => {
+          // If stop() ran during connect (React StrictMode remount), close now
+          // that it is OPEN — closing a CONNECTING socket logs a browser warning.
+          if (this.stopped) socket.close();
+          resolve();
+        };
         socket.onmessage = (event: MessageEvent) => this.handleMessage(event);
-        socket.onerror = () => this.errorCb?.(new Error('WebSocket transport error'));
+        socket.onerror = () => {
+          if (!this.stopped) this.errorCb?.(new Error('WebSocket transport error'));
+        };
         this.socket = socket;
       } catch (err) {
         reject(err instanceof Error ? err : new Error(String(err)));
@@ -88,13 +98,18 @@ export class WebSocketRecordingTransport implements RecordingTransport {
   }
 
   async stop(): Promise<void> {
-    if (this.socket) {
+    this.stopped = true;
+    const socket = this.socket;
+    this.socket = null;
+    if (!socket) return;
+    // Only close an already-open socket here; a CONNECTING one is closed in
+    // onopen (above) to avoid the "closed before established" console warning.
+    if (socket.readyState === WebSocket.OPEN) {
       try {
-        this.socket.close();
+        socket.close();
       } catch {
         // Already closing/closed.
       }
-      this.socket = null;
     }
   }
 }
