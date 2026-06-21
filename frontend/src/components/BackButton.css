@@ -1,0 +1,11 @@
+/* Back tile: a normal board tile ("Terug" + arrow) filling its layout cell. */
+.back-button__arrow {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  font-size: clamp(26px, 3.4vw, 44px);
+  font-weight: 700;
+  line-height: 1;
+}

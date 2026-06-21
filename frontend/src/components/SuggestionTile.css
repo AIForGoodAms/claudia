@@ -1,0 +1,54 @@
+/* Suggestion tiles are roomier than board tiles: they carry a short phrase and
+   may show a sequence of symbols. Width grows to fit the symbol row. */
+.suggestion-tile {
+  width: clamp(160px, 22vw, 240px);
+  height: clamp(140px, 20vw, 200px);
+  /* No resting border (it overlapped neighbours in the grid) — the border space
+     is kept but transparent so selecting a tile causes no layout shift. */
+  border-color: transparent;
+}
+
+/* No box-shadow in any state on these tiles — the only visual cue is the border. */
+.suggestion-tile,
+.suggestion-tile:hover,
+.suggestion-tile:focus-visible,
+.suggestion-tile.dwell-tile--dwelling,
+.suggestion-tile.dwell-tile--speaking {
+  box-shadow: none;
+}
+
+/* The last pronounced tile keeps a red border highlight until the next pick. */
+.suggestion-tile--selected {
+  border-color: var(--record-color);
+}
+
+.suggestion-tile__symbols {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+}
+
+.suggestion-tile__symbols .symbol {
+  flex: 0 1 auto;
+  max-width: 72px;
+}
+
+.suggestion-tile__img {
+  max-width: 72px;
+  max-height: 72px;
+  object-fit: contain;
+}
+
+/* Contract render rule: as_text === true → show the gloss as text, no image. */
+.suggestion-tile__text {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  font-weight: 600;
+  font-size: clamp(16px, 2.4vw, 22px);
+  line-height: 1.1;
+  color: var(--text-strong, #1a1a1a);
+}

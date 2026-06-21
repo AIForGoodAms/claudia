@@ -1,0 +1,95 @@
+.dwell-tile {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  /* Default standalone size; on a board the cell drives width/height to 100%. */
+  width: var(--tile-size);
+  height: var(--tile-size);
+  padding: 6px 8px;
+  border: 2px solid var(--tile-border);
+  border-radius: var(--tile-radius);
+  background: var(--tile-bg, var(--tile-white));
+  color: var(--text);
+  cursor: pointer;
+  overflow: hidden;
+  transition: box-shadow 120ms ease;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.dwell-tile:hover,
+.dwell-tile:focus-visible {
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+}
+
+.dwell-tile--dwelling {
+  box-shadow: 0 0 0 3px rgba(var(--sonar-color), 0.5);
+}
+
+/* Brief highlight while an utterance is being spoken aloud. */
+.dwell-tile--speaking {
+  box-shadow: 0 0 0 4px rgba(var(--sonar-color), 0.85);
+}
+
+/* Selected/flagged state: a persistent red border. Used by the eye-control
+   "rest" tile to show eye-gaze tracking has been disconnected. */
+.dwell-tile--disconnected {
+  border-color: var(--record-color);
+  box-shadow: 0 0 0 3px rgba(229, 68, 59, 0.55);
+}
+
+/* The new record entry point — a subtle red ring sets it apart on the board. */
+.record-tile {
+  box-shadow: 0 0 0 2px rgba(229, 68, 59, 0.35);
+}
+
+.dwell-tile__content {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: 100%;
+  height: 100%;
+}
+
+/*
+ * The label (caregiver/dev text, spoken aloud) sits on top, as on the device.
+ * It is never clipped: it wraps to as many lines as it needs and keeps its
+ * natural height; the symbol below flex-shrinks to make room.
+ */
+.dwell-tile__label {
+  flex: 0 0 auto;
+  font-size: var(--label-size);
+  line-height: 1.15;
+  text-align: center;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* Smaller text for longer phrases / paragraphs so it never clips. */
+.dwell-tile--text-sm .dwell-tile__label {
+  font-size: clamp(9px, 0.85vw, 13px);
+}
+
+.dwell-tile--text-xs .dwell-tile__label {
+  font-size: clamp(7px, 0.72vw, 11px);
+  line-height: 1.1;
+}
+
+/* Big plain glyph (NEE's ✕, "37", "95") instead of / beside a symbol. */
+.dwell-tile__glyph {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  font-size: clamp(20px, 3.5vw, 44px);
+  font-weight: 700;
+}
