@@ -2,6 +2,7 @@ import json
 import sqlite3
 from collections import deque
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -18,6 +19,14 @@ from claudia.vad import SileroVad
 from claudia.models import Option
 
 app = FastAPI()
+
+# Allow the local Vite dev server (different origin) to call the REST endpoints.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _open_conn():
