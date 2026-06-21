@@ -4,9 +4,9 @@
 
 **Goal:** A local web app where a conversation partner speaks, the backend transcribes the speech, an LLM proposes responses in the user's voice rendered as symbol sequences, and she picks one to be spoken aloud.
 
-**Architecture:** FastAPI backend with a WebSocket audio loop (browser mic → 16 kHz PCM16 frames → backend VAD endpointing → Parakeet ASR → GLM-5.2 option generation → E5 semantic search → symbol cards pushed back). SQLite stores symbols, per-language embeddings, persona, and the interaction/option learning log. Plain HTML/CSS/JS front-end with dwell-to-select and browser TTS.
+**Architecture:** FastAPI backend with a WebSocket audio loop (browser mic → 16 kHz PCM16 frames → Silero VAD endpointing → Parakeet ASR → GLM-5.2 option generation → E5 semantic search → symbol cards). Proposed option-sets are held in a per-connection queue and released one at a time — the next set is sent only after she selects from the current one. When semantic search finds no usable symbols, a default set of common core symbols (one of which is the "I don't understand, please explain" symbol) is returned instead. SQLite stores symbols, per-language embeddings, persona, and the interaction/option learning log. Plain HTML/CSS/JS front-end with dwell-to-select and browser TTS.
 
-**Tech Stack:** Python 3.11 · FastAPI · Uvicorn · httpx · pydantic v2 · numpy · sqlite3 (stdlib) · pytest + pytest-asyncio · vitest (front-end units) · OpenRouter (Parakeet ASR, GLM-5.2 LLM, multilingual-e5-large embeddings).
+**Tech Stack:** Python 3.11 · FastAPI · Uvicorn · httpx · pydantic v2 · numpy · silero-vad (PyTorch VAD) · sqlite3 (stdlib) · pytest + pytest-asyncio · vitest (front-end units) · OpenRouter (Parakeet ASR, GLM-5.2 LLM, multilingual-e5-large embeddings).
 
 ## Relationship to the ARASAAC seeding plan (source of truth)
 
@@ -24,6 +24,7 @@ The **ARASAAC seeding plan** (`docs/superpowers/plans/2026-06-21-arasaac-symbol-
 - **This plan owns only the live-path tables** — `interactions`, `options`, `persona`, `settings` — in a new `store.py`. It must NOT create `symbols`/`symbol_terms` (the seeding `db.py` owns those).
 - **Embeddings go through the seeding `embedder.py`** (sync). The live path calls it off the event loop with `asyncio.to_thread`. There is no embedder task here.
 - **There is no indexing task here** — the seeding plan builds it.
+- **Core/default symbols come from the seed:** the default board (Task 12's fallback) is the `symbols.is_core = 1` rows, so the seeding plan's `core_words.txt` must include the common core symbols **and** an "I don't understand, please explain" symbol marked core. If the dictionary has no core rows yet, the fallback degrades to a single text-only "I don't understand, please explain" option so the guarantee always holds.
 - **Idempotency:** every schema this plan creates uses `CREATE TABLE IF NOT EXISTS`; `settings` are seeded with `INSERT OR IGNORE`; any symbol rows created in tests use the seeding `db.insert_symbol`/`insert_term`, which are idempotent through `external_id UNIQUE`.
 
 ## Global Constraints
@@ -34,7 +35,10 @@ Every task's requirements implicitly include this section. Values copied verbati
 - **Model ids (OpenRouter):** ASR `nvidia/parakeet-tdt-0.6b-v3`; LLM `z-ai/glm-5.2`; embeddings `intfloat/multilingual-e5-large` (provided by the seeding `embedder.py`).
 - **Embedding dims:** 1024, stored as little-endian `float32`. E5 prefixes — `query: ` on lookup text, `passage: ` on stored descriptions — applied inside `embedder.embed`, never by callers.
 - **One external API key:** `OPENROUTER_API_KEY`. Base URL `https://openrouter.ai/api/v1` (OpenAI-compatible).
-- **Audio:** 16 kHz mono PCM16, ~20 ms frames.
+- **Audio:** 16 kHz mono PCM16. The browser streams small frames; the backend rechunks them into the 512-sample (32 ms) windows Silero VAD requires.
+- **VAD:** Silero VAD (`silero-vad`) is the voice-activity detector — we do **not** hand-roll speech/silence detection. Its `VADIterator` also does the endpointing, so `vad_silence_ms` maps to silero's `min_silence_duration_ms`. Our only audio code is the trivial glue that buffers the speech between silero's start/end events into a `Segment`, with the VAD injected so it stays deterministically testable without torch.
+- **Queueing:** proposed option-sets are queued per WebSocket connection and released one at a time — the next set is sent only after the front-end reports a selection. This stops a fast-talking partner from flooding her with option sets she hasn't answered.
+- **Default symbols:** when no proposed option matched any symbol via similarity search, return the core default board instead. It always includes the "I don't understand, please explain" symbol so she can always ask for clarification.
 - **Default settings:** `lang='nl'`, `option_count='5'`, `match_threshold='0.30'`, `vad_silence_ms='800'`, `echo_guard_ms='300'`, `asr_model='nvidia/parakeet-tdt-0.6b-v3'`.
 - **Languages:** Dutch primary, English supported. `settings.lang` is the single source of truth.
 - **Naming (per CLAUDE.md):** full words, booleans as questions (`is_*`/`has_*`), functions are verbs, no noise words. Comment the *why*, not the *what*.
@@ -53,7 +57,7 @@ Every task's requirements implicitly include this section. Values copied verbati
 | T1 | Scaffold, deps, config, models | 0 | — | `pyproject.toml`, `config.py`, `models.py`, `tests/conftest.py`, `media/.gitkeep` |
 | T2 | Live-path store + settings | 1 | T1 | `store.py`, `tests/test_store.py` |
 | T3 | OpenRouter client (chat + transcribe) | 1 | T1 | `openrouter.py`, `tests/test_openrouter.py` |
-| T4 | Audio segmenter (VAD endpointing) | 1 | T1 | `audio_stream.py`, `vad.py`, `tests/test_audio_stream.py` |
+| T4 | Audio segmenter (Silero VAD endpointing) | 1 | T1 | `audio_stream.py`, `vad.py`, `tests/test_audio_stream.py` |
 | T5 | Utterance composer | 1 | T1 | `utterance.py`, `tests/test_utterance.py` |
 | T6 | Front-end pure utilities | 1 | T1 | `frontend/src/{downsample,echo-gate,selection-input}.js`, `frontend/test/*`, `frontend/package.json` |
 | T7 | Persona + learning log | 2 | T2 | `persona.py`, `tests/test_persona.py` |
@@ -70,7 +74,7 @@ Every task's requirements implicitly include this section. Values copied verbati
 
 **Sequencing rationale:**
 - T1 is alone in Wave 0 because all live-path tasks import `models.py`/`config.py`. Defining every shared type and dependency once, up front, keeps the later waves conflict-free.
-- Wave 1 (5 agents) holds everything needing only T1: the live-path store, the HTTP client, the VAD state machine, the composer, and the front-end pure functions.
+- Wave 1 (5 agents) holds everything needing only T1: the live-path store, the HTTP client, the segment buffer around Silero VAD, the composer, and the front-end pure functions.
 - Wave 2 (3 agents) holds the thin model wrappers (transcriber/option-gen need T3) and the persona store (needs T2). The former embedder task is gone.
 - T11 → T12 are serial (translator calls symbol search; symbol search calls the seeding embedder). This is the one unavoidable chain, and it also gates on the seeding plan having shipped `embedder.py`/`db.py`.
 - T14 is the integration barrier — one agent wires orchestration so type mismatches surface in one place.
@@ -107,11 +111,10 @@ dependencies = [
     "pydantic>=2.6",
     "numpy>=1.26",
     "python-multipart>=0.0.9",
+    "silero-vad>=5.1",          # the VAD (pulls torch); we do not hand-roll detection
 ]
 
 [project.optional-dependencies]
-# Production VAD. Heavy (pulls torch); dev/CI use the numpy EnergyDetector instead.
-vad = ["silero-vad>=5.1"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [tool.pytest.ini_options]
@@ -463,56 +466,73 @@ git commit -m "feat: OpenRouter client for chat and transcription"
 
 ---
 
-## Task 4: Audio segmenter (VAD endpointing)
+## Task 4: Audio segmenter (Silero VAD endpointing)
 
 **Files:**
-- Create: `audio_stream.py` (the testable state machine)
-- Create: `vad.py` (the real detectors; selected at runtime)
+- Create: `audio_stream.py` (the testable segment-buffering state machine)
+- Create: `vad.py` (the Silero VAD wrapper; loaded at runtime)
 - Test: `tests/test_audio_stream.py`
+
+**Why Silero:** speech/non-speech classification is exactly the kind of thing not to hand-roll — Silero VAD is a small, fast, well-tuned model and its `VADIterator` already does endpointing (`min_silence_duration_ms`). We keep only the trivial glue that rechunks the byte stream into the 512-sample windows silero needs and buffers the speech between a `start` event and its `end` event into one `Segment`. The `vad` is injected so the state machine stays deterministically testable without torch.
 
 **Interfaces:**
 - Consumes: `models.Segment`.
 - Produces:
-  - `Segmenter(detector, sample_rate=16000, frame_ms=20, silence_ms=800)` with `feed(frame: bytes) -> Segment | None` and `reset() -> None`. `detector` is any callable `bytes -> bool`. Emits a `Segment` when speech is followed by `silence_ms` of non-speech.
-  - `vad.EnergyDetector(threshold=...)` (pure numpy, dev/CI default) and `vad.SileroDetector()` (lazy torch import, production). Both callables `bytes -> bool`.
+  - `Segmenter(vad, sample_rate=16000)` with `feed(frame: bytes) -> Segment | None` and `reset() -> None`. `vad` is any callable taking one 512-sample (1024-byte) PCM16 window and returning Silero's `VADIterator` event — `{"start": idx}`, `{"end": idx}`, or `None`. Emits one `Segment` per completed utterance; returns `None` until the VAD reports the end of speech.
+  - `vad.SileroVad(sample_rate=16000, threshold=0.5, min_silence_ms=800)` — a callable `bytes -> dict | None` wrapping `silero_vad.VADIterator` (lazy torch import). `reset()` clears its internal states. This is the only real detector; there is no homegrown energy detector.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
 from audio_stream import Segmenter
 
-FRAME = b"\x00\x00" * 320            # 20 ms of silence at 16 kHz (640 bytes)
-VOICE = b"\x10\x00" * 320            # 20 ms of "speech"
+WINDOW = b"\x10\x00" * 512            # one 512-sample (1024-byte) window of "speech"
 
 
-class ScriptedDetector:
-    def __call__(self, frame: bytes) -> bool:
-        return frame == VOICE
+class ScriptedVad:
+    """Replays a fixed list of VADIterator events, one per 512-sample window."""
+
+    def __init__(self, events):
+        self._events = list(events)
+        self._index = 0
+
+    def __call__(self, window: bytes):
+        event = self._events[self._index] if self._index < len(self._events) else None
+        self._index += 1
+        return event
+
+    def reset(self):
+        pass                                  # no rewind: mirrors silero's stateless reset
 
 
-def test_emits_segment_after_trailing_silence():
-    seg = Segmenter(ScriptedDetector(), silence_ms=40, frame_ms=20)
-    assert seg.feed(VOICE) is None
-    assert seg.feed(VOICE) is None
-    assert seg.feed(FRAME) is None           # 20 ms < 40 ms
-    out = seg.feed(FRAME)                     # endpoint reached
+def test_emits_segment_on_speech_end():
+    seg = Segmenter(ScriptedVad([{"start": 0}, None, {"end": 1536}]))
+    assert seg.feed(WINDOW) is None           # speech start
+    assert seg.feed(WINDOW) is None           # mid-speech
+    out = seg.feed(WINDOW)                     # speech end → emit
     assert out is not None
-    assert out.pcm == VOICE + VOICE          # trailing silence trimmed
+    assert out.pcm == WINDOW * 3             # the windows from start through end
 
 
-def test_ignores_leading_silence():
-    seg = Segmenter(ScriptedDetector(), silence_ms=40, frame_ms=20)
-    assert seg.feed(FRAME) is None
-    assert seg.feed(FRAME) is None
-    assert seg.feed(VOICE) is None
+def test_ignores_audio_before_speech_start():
+    seg = Segmenter(ScriptedVad([None, None, {"start": 1024}]))
+    assert seg.feed(WINDOW) is None
+    assert seg.feed(WINDOW) is None
+    assert seg.feed(WINDOW) is None           # speech just started; nothing emitted yet
 
 
-def test_reset_discards_buffer():
-    seg = Segmenter(ScriptedDetector(), silence_ms=40, frame_ms=20)
-    seg.feed(VOICE)
-    seg.reset()
-    assert seg.feed(FRAME) is None
-    assert seg.feed(FRAME) is None
+def test_rechunks_a_multi_window_frame():
+    seg = Segmenter(ScriptedVad([{"start": 0}, {"end": 1024}]))
+    out = seg.feed(WINDOW + WINDOW)           # one feed carrying two 512-sample windows
+    assert out is not None and out.pcm == WINDOW * 2
+
+
+def test_reset_discards_buffered_speech():
+    seg = Segmenter(ScriptedVad([{"start": 0}, None, {"end": 1024}]))
+    seg.feed(WINDOW)                          # start, buffering
+    seg.feed(WINDOW)                          # still buffering
+    seg.reset()                               # clears the buffer + in-speech state
+    assert seg.feed(WINDOW) is None           # the now-stray "end" is ignored
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -525,87 +545,94 @@ Expected: FAIL — `No module named 'audio_stream'`
 ```python
 from models import Segment
 
+WINDOW_SAMPLES = 512                          # the window size silero-vad needs at 16 kHz
+WINDOW_BYTES = WINDOW_SAMPLES * 2             # PCM16: 2 bytes per sample
+
 
 class Segmenter:
-    """Turns a stream of fixed-size frames into utterance-sized Segments.
+    """Buffers the speech between silero-vad's start and end events.
 
-    Buffers consecutive speech frames; once `silence_ms` of non-speech follows
-    speech, emits the buffered speech as one Segment (trailing silence trimmed)
-    and resets.
+    Rechunks the incoming byte stream into fixed 512-sample windows, feeds each
+    to `vad`, and accumulates windows from a `start` event through its `end`
+    event into one Segment. The speech/silence decision and endpointing live in
+    silero; this only does the buffering.
     """
 
-    def __init__(self, detector, sample_rate=16000, frame_ms=20, silence_ms=800):
-        self._detector = detector
+    def __init__(self, vad, sample_rate=16000):
+        self._vad = vad
         self._sample_rate = sample_rate
-        self._silence_frames_needed = max(1, silence_ms // frame_ms)
-        self._speech_frames: list[bytes] = []
-        self._trailing_silence = 0
+        self._pending = b""
+        self._speech: list[bytes] = []
+        self._in_speech = False
 
     def feed(self, frame: bytes) -> Segment | None:
-        if self._detector(frame):
-            self._speech_frames.append(frame)
-            self._trailing_silence = 0
-            return None
-        if not self._speech_frames:
-            return None
-        self._trailing_silence += 1
-        if self._trailing_silence < self._silence_frames_needed:
-            return None
-        pcm = b"".join(self._speech_frames)
-        self.reset()
-        return Segment(pcm=pcm, sample_rate=self._sample_rate)
+        self._pending += frame
+        segment = None
+        while len(self._pending) >= WINDOW_BYTES:
+            window = self._pending[:WINDOW_BYTES]
+            self._pending = self._pending[WINDOW_BYTES:]
+            event = self._vad(window)
+            if event and "start" in event:
+                self._in_speech = True
+                self._speech = [window]
+            elif event and "end" in event and self._in_speech:
+                self._speech.append(window)
+                segment = Segment(pcm=b"".join(self._speech), sample_rate=self._sample_rate)
+                self._in_speech = False
+                self._speech = []
+            elif self._in_speech:
+                self._speech.append(window)
+        return segment
 
     def reset(self) -> None:
-        self._speech_frames = []
-        self._trailing_silence = 0
+        self._pending = b""
+        self._speech = []
+        self._in_speech = False
+        if hasattr(self._vad, "reset"):
+            self._vad.reset()
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/test_audio_stream.py -v`
-Expected: PASS (3 tests)
+Expected: PASS (4 tests)
 
-- [ ] **Step 5: Write `vad.py`** (real detectors; exercised in the WS smoke later)
+- [ ] **Step 5: Write `vad.py`** (the Silero wrapper; exercised in the WS smoke later, not unit-tested)
 
 ```python
 import numpy as np
 
 
-class EnergyDetector:
-    """Cheap RMS-energy speech detector. Default for dev/CI (no torch)."""
+class SileroVad:
+    """Streaming voice-activity detector backed by silero-vad's VADIterator.
 
-    def __init__(self, threshold: float = 500.0):
-        self._threshold = threshold
+    Call with exactly one 512-sample (1024-byte) PCM16 window at 16 kHz — the
+    window size silero requires. Returns {"start": idx} / {"end": idx} on a
+    speech boundary, else None. `min_silence_ms` is silero's own endpointing
+    threshold, so the pause that ends an utterance is its decision, not ours.
+    """
 
-    def __call__(self, frame: bytes) -> bool:
-        samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
-        if samples.size == 0:
-            return False
-        return float(np.sqrt(np.mean(samples ** 2))) >= self._threshold
+    def __init__(self, sample_rate: int = 16000, threshold: float = 0.5,
+                 min_silence_ms: int = 800):
+        from silero_vad import load_silero_vad, VADIterator
+        self._iterator = VADIterator(
+            load_silero_vad(), threshold=threshold,
+            sampling_rate=sample_rate, min_silence_duration_ms=min_silence_ms)
 
-
-class SileroDetector:
-    """Production detector. Lazily loads silero-vad (torch) on first call."""
-
-    def __init__(self, sample_rate: int = 16000, threshold: float = 0.5):
-        self._sample_rate = sample_rate
-        self._threshold = threshold
-        self._model = None
-
-    def __call__(self, frame: bytes) -> bool:
-        if self._model is None:
-            from silero_vad import load_silero_vad
-            self._model = load_silero_vad()
+    def __call__(self, window: bytes):
         import torch
-        samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
-        return self._model(torch.from_numpy(samples), self._sample_rate).item() >= self._threshold
+        samples = np.frombuffer(window, dtype=np.int16).astype(np.float32) / 32768.0
+        return self._iterator(torch.from_numpy(samples))
+
+    def reset(self) -> None:
+        self._iterator.reset_states()
 ```
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add audio_stream.py vad.py tests/test_audio_stream.py
-git commit -m "feat: VAD segmenter with endpointing + energy/silero detectors"
+git commit -m "feat: Silero VAD segmenter — rechunk + buffer speech into segments"
 ```
 
 ---
@@ -1259,10 +1286,12 @@ git commit -m "feat: cosine top-k symbol search over seeded per-language vectors
 
 **Interfaces:**
 - Consumes: `symbol_search.search`, `openrouter.chat`, `config.MODEL_LLM`, `models.SymbolCard`.
-- Produces (async):
+- Produces (async, except the helpers below which are sync):
   - `to_symbols(conn, glosses: list[str], lang: str, threshold: float) -> list[SymbolCard]` — best symbol per gloss; below `threshold` → `as_text=True` card with `image_url=None`.
   - `glossify(text: str, lang: str) -> list[str]` — LLM decomposition (dev/`/translate` only).
   - `image_url_for(image_path: str) -> str` — `"/media/" + basename`.
+  - `core_symbols(conn, lang) -> list[SymbolCard]` — the `symbols.is_core = 1` rows for `lang`, as ready-to-show cards.
+  - `default_symbol_options(conn, lang) -> tuple[list[str], list[list[SymbolCard]]]` — the fallback board used when no proposed option matched any symbol. Each core symbol becomes its own one-symbol option. Always includes the "I don't understand, please explain" symbol; if the dictionary has no core rows yet, it degrades to a single text-only option carrying that phrase.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1299,6 +1328,34 @@ async def test_glossify_returns_core_words(monkeypatch):
 
     monkeypatch.setattr(openrouter, "chat", fake_chat)
     assert await translator.glossify("ik wil graag koffie", "nl") == ["ik", "wil", "koffie"]
+
+
+def _add_core(conn, label, image_path="help.png", lang="nl"):
+    import db, embedder
+    sid = db.insert_symbol(conn, source="arasaac", external_id=label,
+                           image_path=f"media/{image_path}", is_core=1, created_at="t0")
+    db.insert_term(conn, symbol_id=sid, lang=lang, label=label, description=label,
+                   vector=db.pack_vector([0.0] * embedder.DIMS), model=embedder.MODEL_TAG)
+
+
+def test_core_symbols_returns_seeded_core(conn):
+    _add_core(conn, "help")
+    cards = translator.core_symbols(conn, "nl")
+    assert [c.label for c in cards] == ["help"]
+    assert cards[0].image_url == "/media/help.png" and cards[0].as_text is False
+
+
+def test_default_symbol_options_use_core_when_present(conn):
+    _add_core(conn, "ik begrijp het niet")
+    texts, card_lists = translator.default_symbol_options(conn, "nl")
+    assert texts == ["ik begrijp het niet"]
+    assert card_lists[0][0].as_text is False
+
+
+def test_default_symbol_options_fall_back_to_dont_understand(conn):
+    texts, card_lists = translator.default_symbol_options(conn, "nl")   # empty dictionary
+    assert texts == ["Ik begrijp het niet, leg het uit"]
+    assert card_lists[0][0].as_text is True and card_lists[0][0].image_url is None
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1321,9 +1378,40 @@ _GLOSSIFY_SYSTEM = (
     'lookup, same language. Return JSON: {"glosses": [<words>]}.'
 )
 
+# Guaranteed phrase she can always say, even before any core symbols are seeded.
+_FALLBACK_TEXT = {
+    "nl": "Ik begrijp het niet, leg het uit",
+    "en": "I don't understand, please explain",
+}
+
 
 def image_url_for(image_path: str) -> str:
     return "/media/" + PurePath(image_path).name
+
+
+def core_symbols(conn, lang: str) -> list[SymbolCard]:
+    rows = conn.execute(
+        "SELECT t.symbol_id, t.label, s.image_path "
+        "FROM symbol_terms t JOIN symbols s ON s.id = t.symbol_id "
+        "WHERE s.is_core = 1 AND t.lang = ? ORDER BY t.symbol_id", (lang,)).fetchall()
+    return [SymbolCard(id=row["symbol_id"], label=row["label"],
+                       image_url=image_url_for(row["image_path"]),
+                       confidence=1.0, as_text=False) for row in rows]
+
+
+def default_symbol_options(conn, lang: str):
+    """Fallback board when no proposed option matched any symbol.
+
+    Each core symbol becomes its own one-symbol option. If the dictionary has no
+    core symbols yet, fall back to a single text option so she can always say she
+    does not understand.
+    """
+    cards = core_symbols(conn, lang)
+    if cards:
+        return [card.label for card in cards], [[card] for card in cards]
+    text = _FALLBACK_TEXT.get(lang, _FALLBACK_TEXT["en"])
+    return [text], [[SymbolCard(id=-1, label=text, image_url=None,
+                                confidence=0.0, as_text=True)]]
 
 
 async def to_symbols(conn, glosses, lang, threshold) -> list[SymbolCard]:
@@ -1356,13 +1444,13 @@ async def glossify(text: str, lang: str) -> list[str]:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/test_translator.py -v`
-Expected: PASS (3 tests)
+Expected: PASS (6 tests)
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add translator.py tests/test_translator.py
-git commit -m "feat: translator maps glosses to symbols with threshold + glossify"
+git commit -m "feat: translator — gloss→symbol mapping, glossify, default core-symbol fallback"
 ```
 
 ---
@@ -1383,8 +1471,8 @@ The offline ARASAAC import/seed/embed pipeline is owned entirely by the ARASAAC 
 **Interfaces:**
 - Consumes: `db` (seeding, for connect + symbol schema), `store` (live schema + settings), `persona`, `option_generator`, `translator`, `transcriber`, `audio_stream`, `vad`, `utterance`, `config`, `models.Option`.
 - Produces:
-  - `propose(conn, *, context_text, lang, context_type, audio_path=None, asr_model=None) -> dict` — shared orchestration → `{"interaction_id": int, "options": [Option...]}`.
-  - FastAPI `app`: `POST /expressive/options` (dev), `POST /expressive/select`, `POST /translate`, `WS /expressive/listen`, `/media/*` static mount.
+  - `propose(conn, *, context_text, lang, context_type, audio_path=None, asr_model=None) -> dict` — shared orchestration → `{"interaction_id": int, "options": [Option...]}`. When no proposed option matched any symbol, the options are replaced by `translator.default_symbol_options` (the core board incl. "I don't understand, please explain") before persisting.
+  - FastAPI `app`. REST: `POST /expressive/options` (dev), `POST /expressive/select`, `POST /translate`. WS `/expressive/listen`: proposed option-sets are **queued and released one at a time** — the next set is sent only after a `{"type":"select", ...}` control message reports her choice; the WS speaks the chosen text back as `{"type":"speak"}`. Plus the `/media/*` static mount.
 
 - [ ] **Step 1: Write the failing test for the dev propose path**
 
@@ -1433,6 +1521,30 @@ def test_select_unknown_returns_404(client):
     res = client.post("/expressive/select",
                       json={"interaction_id": 999, "option_id": 999})
     assert res.status_code == 404
+
+
+def test_options_fall_back_to_defaults_when_no_symbols(conn, monkeypatch):
+    import db, embedder
+    sid = db.insert_symbol(conn, source="arasaac", external_id="dont-understand",
+                           image_path="media/help.png", is_core=1, created_at="t0")
+    db.insert_term(conn, symbol_id=sid, lang="nl", label="ik begrijp het niet",
+                   description="uitleg", vector=db.pack_vector([0.0] * embedder.DIMS),
+                   model=embedder.MODEL_TAG)
+    monkeypatch.setattr(api, "_open_conn", lambda: conn)
+
+    async def fake_generate(context, persona, history, n, lang):
+        return [Candidate(text="iets", glosses=["onbekend"])]
+
+    async def fake_to_symbols(connection, glosses, lang, threshold):    # nothing matches
+        return [SymbolCard(id=-1, label=g, image_url=None, confidence=0.0, as_text=True)
+                for g in glosses]
+
+    monkeypatch.setattr(option_generator, "generate", fake_generate)
+    monkeypatch.setattr(translator, "to_symbols", fake_to_symbols)
+    res = TestClient(api.app).post("/expressive/options", json={"text": "?", "lang": "nl"})
+    body = res.json()
+    assert body["options"][0]["text"] == "ik begrijp het niet"
+    assert body["options"][0]["symbols"][0]["as_text"] is False
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1445,6 +1557,7 @@ Expected: FAIL — `No module named 'api'`
 ```python
 import json
 import sqlite3
+from collections import deque
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -1458,7 +1571,7 @@ import transcriber
 import utterance
 import config
 from audio_stream import Segmenter
-from vad import EnergyDetector
+from vad import SileroVad
 from models import Option
 
 app = FastAPI()
@@ -1488,6 +1601,10 @@ class TranslateIn(BaseModel):
     lang: str | None = None
 
 
+def _has_matched_symbol(card_lists) -> bool:
+    return any(not card.as_text for cards in card_lists for card in cards)
+
+
 async def propose(conn, *, context_text, lang, context_type,
                   audio_path=None, asr_model=None) -> dict:
     who = persona.load(conn)
@@ -1496,18 +1613,24 @@ async def propose(conn, *, context_text, lang, context_type,
     threshold = float(store.get_setting(conn, "match_threshold"))
     candidates = await option_generator.generate(context_text, who, history, n, lang)
 
+    texts, card_lists = [], []
+    for candidate in candidates:
+        texts.append(candidate.text)
+        card_lists.append(await translator.to_symbols(conn, candidate.glosses, lang, threshold))
+
+    # Similarity search found nothing usable → fall back to the common core board.
+    if not _has_matched_symbol(card_lists):
+        texts, card_lists = translator.default_symbol_options(conn, lang)
+
     interaction_id = persona.log_interaction(
         conn, lang, context_type, context_text, audio_path, asr_model)
-
-    rows, card_lists = [], []
-    for rank, candidate in enumerate(candidates):
-        cards = await translator.to_symbols(conn, candidate.glosses, lang, threshold)
-        card_lists.append(cards)
-        rows.append({"rank": rank, "text": candidate.text, "glosses": candidate.glosses,
-                     "symbol_sequence": [c.id for c in cards if not c.as_text]})
+    rows = [{"rank": rank, "text": texts[rank],
+             "glosses": [card.label for card in card_lists[rank]],
+             "symbol_sequence": [card.id for card in card_lists[rank] if not card.as_text]}
+            for rank in range(len(texts))]
     option_ids = persona.save_options(conn, interaction_id, rows)
 
-    options = [Option(option_id=oid, text=candidates[i].text, symbols=card_lists[i])
+    options = [Option(option_id=oid, text=texts[i], symbols=card_lists[i])
                for i, oid in enumerate(option_ids)]
     return {"interaction_id": interaction_id, "options": options}
 
@@ -1547,19 +1670,50 @@ async def listen(ws: WebSocket):
     conn = _open_conn()
     lang = store.get_setting(conn, "lang")
     silence_ms = int(store.get_setting(conn, "vad_silence_ms"))
-    segmenter = Segmenter(EnergyDetector(), silence_ms=silence_ms)
+    segmenter = Segmenter(SileroVad(min_silence_ms=silence_ms))
+
+    pending_options = deque()      # proposed option-sets awaiting their turn
+    awaiting_selection = False     # is an option-set currently shown to her?
     muted = False
+
+    async def release_next() -> None:
+        nonlocal awaiting_selection
+        if awaiting_selection or not pending_options:
+            return
+        result = pending_options.popleft()
+        awaiting_selection = True
+        await ws.send_json({
+            "type": "utterance",
+            "interaction_id": result["interaction_id"],
+            "transcript": result["transcript"],
+            "options": [option.model_dump() for option in result["options"]],
+        })
+
     try:
         while True:
             message = await ws.receive()
             if message.get("text") is not None:
                 control = json.loads(message["text"])
-                if control.get("type") == "mute":
+                kind = control.get("type")
+                if kind == "mute":
                     muted = True
                     segmenter.reset()
-                elif control.get("type") == "unmute":
+                elif kind == "unmute":
                     muted = False
+                elif kind == "select":
+                    try:
+                        text = persona.mark_selected(
+                            conn, control["interaction_id"], control["option_id"])
+                    except KeyError:
+                        await ws.send_json({"type": "error", "detail": "unknown selection"})
+                        continue
+                    spoken = utterance.compose(text, lang)
+                    await ws.send_json({"type": "speak", "text": spoken.text,
+                                        "lang": spoken.lang})
+                    awaiting_selection = False
+                    await release_next()      # her selection releases the next queued set
                 continue
+
             frame = message.get("bytes")
             if frame is None or muted:
                 continue
@@ -1571,12 +1725,9 @@ async def listen(ws: WebSocket):
                 continue
             result = await propose(conn, context_text=transcript.text, lang=lang,
                                    context_type="audio", asr_model=config.MODEL_ASR)
-            await ws.send_json({
-                "type": "utterance",
-                "interaction_id": result["interaction_id"],
-                "transcript": transcript.text,
-                "options": [o.model_dump() for o in result["options"]],
-            })
+            result["transcript"] = transcript.text
+            pending_options.append(result)
+            await release_next()              # sends now only if nothing is awaiting selection
     except WebSocketDisconnect:
         return
     finally:
@@ -1603,13 +1754,13 @@ if __name__ == "__main__":
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `pytest tests/test_api.py -v`
-Expected: PASS (2 tests)
+Expected: PASS (3 tests)
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add api.py main.py tests/test_api.py
-git commit -m "feat: API orchestration — options, select, translate, WS listen"
+git commit -m "feat: API orchestration — options, select, translate, queued WS listen, default fallback"
 ```
 
 ---
@@ -1631,16 +1782,36 @@ import api
 import transcriber
 import option_generator
 import translator
-import store
 from models import Transcript, Candidate, SymbolCard
 
-VOICE = b"\x10\x00" * 320
-SILENCE = b"\x00\x00" * 320
+WINDOW = b"\x10\x00" * 512     # one 512-sample "speech" window
+QUIET = b"\x00\x00" * 512      # one 512-sample "silence" window
+
+
+class FakeVad:
+    """Deterministic stand-in for Silero: WINDOW = speech, QUIET = silence."""
+
+    def __init__(self):
+        self._in_speech = False
+
+    def __call__(self, window):
+        is_speech = window == WINDOW
+        if is_speech and not self._in_speech:
+            self._in_speech = True
+            return {"start": 0}
+        if not is_speech and self._in_speech:
+            self._in_speech = False
+            return {"end": 0}
+        return None
+
+    def reset(self):
+        self._in_speech = False
 
 
 @pytest.fixture
 def client(conn, monkeypatch):
     monkeypatch.setattr(api, "_open_conn", lambda: conn)
+    monkeypatch.setattr(api, "SileroVad", lambda **kwargs: FakeVad())   # no torch in CI
 
     async def fake_transcribe(pcm, lang, sample_rate=16000):
         return Transcript(text="wil je koffie?", lang=lang)
@@ -1655,41 +1826,52 @@ def client(conn, monkeypatch):
     monkeypatch.setattr(transcriber, "transcribe", fake_transcribe)
     monkeypatch.setattr(option_generator, "generate", fake_generate)
     monkeypatch.setattr(translator, "to_symbols", fake_to_symbols)
-    store.set_setting(conn, "vad_silence_ms", "40")   # 2 silent frames end a turn
     return TestClient(api.app)
 
 
 def test_audio_stream_yields_options(client):
     with client.websocket_connect("/expressive/listen") as websocket:
-        websocket.send_bytes(VOICE)
-        websocket.send_bytes(VOICE)
-        websocket.send_bytes(SILENCE)
-        websocket.send_bytes(SILENCE)            # endpoint → propose
+        websocket.send_bytes(WINDOW)             # speech start
+        websocket.send_bytes(QUIET)              # silence → endpoint → propose + release
         event = websocket.receive_json()
     assert event["type"] == "utterance"
     assert event["transcript"] == "wil je koffie?"
     assert event["options"][0]["text"] == "ja graag"
 
 
+def test_queue_releases_next_only_after_selection(client):
+    with client.websocket_connect("/expressive/listen") as websocket:
+        websocket.send_bytes(WINDOW); websocket.send_bytes(QUIET)
+        first = websocket.receive_json()
+        assert first["type"] == "utterance"
+
+        # A second utterance arrives while the first is still unselected: it is queued.
+        websocket.send_bytes(WINDOW); websocket.send_bytes(QUIET)
+
+        # Selecting the first speaks it AND releases the queued second.
+        websocket.send_json({"type": "select",
+                             "interaction_id": first["interaction_id"],
+                             "option_id": first["options"][0]["option_id"]})
+        spoken = websocket.receive_json()
+        assert spoken["type"] == "speak" and spoken["text"] == "ja graag"
+        second = websocket.receive_json()
+        assert second["type"] == "utterance"
+
+
 def test_mute_marker_suppresses_options(client):
     with client.websocket_connect("/expressive/listen") as websocket:
         websocket.send_json({"type": "mute"})
-        websocket.send_bytes(VOICE)
-        websocket.send_bytes(SILENCE)
-        websocket.send_bytes(SILENCE)
+        websocket.send_bytes(WINDOW); websocket.send_bytes(QUIET)   # dropped while muted
         websocket.send_json({"type": "unmute"})
-        websocket.send_bytes(VOICE)
-        websocket.send_bytes(VOICE)
-        websocket.send_bytes(SILENCE)
-        websocket.send_bytes(SILENCE)
-        event = websocket.receive_json()         # only the post-unmute utterance
+        websocket.send_bytes(WINDOW); websocket.send_bytes(QUIET)   # heard
+        event = websocket.receive_json()
     assert event["transcript"] == "wil je koffie?"
 ```
 
 - [ ] **Step 2: Run tests to verify they pass**
 
 Run: `pytest tests/test_integration.py -v`
-Expected: PASS (2 tests). If `EnergyDetector` rejects `VOICE`, raise the VOICE amplitude in the fixture until `feed(VOICE)` is detected as speech.
+Expected: PASS (3 tests).
 
 - [ ] **Step 3: Commit**
 
@@ -1709,7 +1891,7 @@ git commit -m "test: end-to-end WS audio→options with mute suppression"
 
 **Interfaces:**
 - Consumes: T6 utilities (`downsampleTo16k`, `EchoGate`, `DwellSelector`); the API contract from T14.
-- Produces: the running UI — mic capture → WS frames; render option rows of large symbol cards; dwell-select → `POST /expressive/select` → speak via `SpeechSynthesis`, with the echo gate muting the mic during playback.
+- Produces: the running UI — mic capture → WS frames; render option rows of large symbol cards; dwell-select → `{"type":"select"}` over the WS → backend replies `{"type":"speak"}` (and releases the next queued set) → speak via `SpeechSynthesis`, with the echo gate muting the mic during playback.
 
 - [ ] **Step 1: Write `frontend/src/tts.js`**
 
@@ -1735,17 +1917,21 @@ export function createSpeaker({ guardMs, onMuteChange }) {
 - [ ] **Step 2: Write `frontend/src/ws-client.js`**
 
 ```javascript
-export function connectListen({ onUtterance }) {
+export function connectListen({ onUtterance, onSpeak }) {
   const ws = new WebSocket(`ws://${location.host}/expressive/listen`);
   ws.binaryType = "arraybuffer";
   ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
     if (msg.type === "utterance") onUtterance(msg);
+    else if (msg.type === "speak") onSpeak(msg);
   };
   return {
     sendFrame: (int16) => { if (ws.readyState === 1) ws.send(int16.buffer); },
     mute: () => ws.readyState === 1 && ws.send(JSON.stringify({ type: "mute" })),
     unmute: () => ws.readyState === 1 && ws.send(JSON.stringify({ type: "unmute" })),
+    // Selecting reports her choice; the backend speaks it and releases the next set.
+    select: (interactionId, optionId) => ws.readyState === 1 && ws.send(
+      JSON.stringify({ type: "select", interaction_id: interactionId, option_id: optionId })),
   };
 }
 ```
@@ -1796,10 +1982,14 @@ import { DwellSelector } from "./selection-input.js";
 const grid = document.getElementById("options");
 let currentInteraction = null;
 
-const ws = connectListen({ onUtterance: renderOptions });
+let ws;
 const speaker = createSpeaker({
   guardMs: 300,
   onMuteChange: (muted) => (muted ? ws.mute() : ws.unmute()),
+});
+ws = connectListen({
+  onUtterance: renderOptions,
+  onSpeak: (message) => speaker.speak(message.text, message.lang),
 });
 const selector = new DwellSelector({ dwellMs: 800, onSelect: choose });
 setInterval(() => selector.tick(), 100);
@@ -1828,15 +2018,13 @@ function renderOptions(message) {
   }
 }
 
-async function choose(optionId) {
-  const row = grid.querySelector(`[data-option-id="${optionId}"]`);
-  if (!row) return;
-  const res = await fetch("/expressive/select", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ interaction_id: currentInteraction, option_id: Number(optionId) }),
-  });
-  const { text, lang } = await res.json();
-  speaker.speak(text, lang);
+// Selecting reports her choice over the WS; the backend speaks it back (handled
+// by onSpeak) and releases the next queued option-set. Clear the grid meanwhile.
+function choose(optionId) {
+  if (currentInteraction === null) return;
+  grid.innerHTML = "";
+  ws.select(currentInteraction, Number(optionId));
+  currentInteraction = null;
 }
 ```
 
@@ -1893,12 +2081,17 @@ test("renders options and selects one", async ({ page }) => {
 - [ ] **Step 8: Manual verification checklist** (TDD is impractical for getUserMedia/WS in CI)
 
 ```
-1. Seed the dictionary: python -m indexing.seed   (seeding plan)
+1. Seed the dictionary: python -m indexing.seed   (seeding plan; must include core symbols
+   and the "I don't understand, please explain" symbol marked is_core)
 2. Set OPENROUTER_API_KEY. Run: python main.py
 3. Open http://127.0.0.1:8000/ , grant mic permission.
 4. Speak a Dutch sentence; confirm option rows of symbol cards appear.
 5. Dwell on one; confirm it is spoken and the mic mutes during playback.
 6. Confirm the spoken reply does NOT produce a new option set (echo guard works).
+7. Speak two sentences in a row without selecting; confirm only ONE option set shows, and
+   the second appears only after you select from the first (queue gating).
+8. Speak something with no matching symbols; confirm the default board appears, including
+   the "I don't understand, please explain" option.
 ```
 
 - [ ] **Step 9: Commit**
@@ -1998,9 +2191,14 @@ git commit -m "test: recall@k retrieval eval harness with seed fixture"
 - §8 data flow — T15 WS test. ✓
 - §9 services — one OpenRouter key: chat/transcribe via `openrouter.py` (T3), embeddings via seeding `embedder.py`. ✓
 - §10 indexing — seeding plan. ✓
-- §11 errors — empty transcript skipped (T14), unknown selection → 404 (T14), TTS echo guard (mute markers T14 + EchoGate T6 + capture gate T16). ✓
-- §12 testing — unit per module; integration T15; recall@k T17. ✓
-- §13 stack / §3 decisions — repo-root layout, model ids, dims, VAD, prefixes consistent with the seeding plan. ✓
+- §11 errors — empty transcript skipped (T14), unknown selection → 404 REST / `{"type":"error"}` WS (T14), TTS echo guard (mute markers T14 + EchoGate T6 + capture gate T16). ✓
+- §12 testing — unit per module; integration T15 (incl. queue-gating + Silero seam via injected `FakeVad`); recall@k T17. ✓
+- §13 stack / §3 decisions — repo-root layout, model ids, dims, prefixes consistent with the seeding plan. ✓
+
+**Requested changes:**
+- **Silero VAD (not hand-rolled)** — `silero-vad` is a core dep (T1); `vad.SileroVad` wraps `VADIterator` and `audio_stream.Segmenter` only buffers between its start/end events (T4); the WS wires `SileroVad` (T14); the homegrown `EnergyDetector` is gone. The injected-`vad` seam keeps T4/T15 testable without torch. ✓
+- **Queue, released on selection** — the WS holds proposed option-sets in a per-connection `deque` and `release_next()` sends one only when nothing is awaiting selection; a `{"type":"select"}` control message clears `awaiting_selection`, speaks the choice, and releases the next (T14). Gating is covered by `test_queue_releases_next_only_after_selection` (T15) and the front-end sends `select` over the WS (T16). ✓
+- **Default symbols when search finds nothing** — `translator.default_symbol_options` returns the `is_core=1` board, with a guaranteed text-only "I don't understand, please explain" fallback when the dictionary has none (T12); `propose` substitutes it when no option matched any symbol (T14, with `test_options_fall_back_to_defaults_when_no_symbols`). The seeding plan must seed that core symbol (noted in the cross-plan section). ✓
 - **Idempotency (the requested change):** `store.create_schema` uses `IF NOT EXISTS` + `INSERT OR IGNORE` (T2 has an explicit idempotency test); symbol rows in tests use the seeding `db.insert_symbol`/`insert_term` (idempotent via `external_id UNIQUE`); `_open_conn` re-runs both `create_schema`s safely on every request. ✓
 
 **Placeholder scan:** every code step contains real, runnable code — no TBD/TODO/"handle edge cases". The only non-code verifications are the T16 manual checklist and Playwright smoke (honestly flagged — getUserMedia/WS cannot be unit-tested deterministically). ✓
