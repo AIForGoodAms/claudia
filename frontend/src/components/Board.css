@@ -1,0 +1,78 @@
+/*
+ * Board surface: an equal-column grid. Tiles are placed by (col, row) and
+ * empty cells are skipped, reproducing the device's scattered arrangement.
+ * Columns are equal width (1fr); rows size to content, and tiles top-align so
+ * each keeps its own content height rather than stretching to the row.
+ */
+.board {
+  display: grid;
+  grid-template-columns: repeat(var(--board-cols, 7), 1fr);
+  gap: var(--tile-gap);
+  align-items: start;
+  justify-items: stretch;
+  align-content: start;
+  width: 100%;
+  max-width: 1280px;
+  margin: 0 auto;
+}
+
+.board__cell {
+  display: flex;
+  min-width: 0;
+}
+
+.board__cell > * {
+  width: 100%;
+}
+
+/* On the board a tile sizes to content (label + fixed-height symbol). */
+.board__cell .dwell-tile {
+  width: 100%;
+  height: auto;
+  min-height: var(--tile-min-h);
+}
+
+/* Symbols/glyphs get a steady height so symbol-only tiles aren't collapsed and
+   text tiles grow taller than them. */
+.board__cell .symbol,
+.board__system-tile .symbol {
+  flex: 0 0 auto;
+  height: clamp(40px, 7.5vh, 84px);
+}
+
+.board .dwell-tile__glyph {
+  flex: 0 0 auto;
+  height: clamp(40px, 7.5vh, 84px);
+}
+
+/* System tiles mirror a tile's look but are inert. */
+.board__system-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: 100%;
+  min-height: var(--tile-min-h);
+  padding: 6px 8px;
+  border: 2px solid var(--tile-border);
+  border-radius: var(--tile-radius);
+  overflow: hidden;
+}
+
+.board__system-label {
+  flex: 0 0 auto;
+  font-size: var(--label-size);
+  text-align: center;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+
+.board__system-glyph {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: clamp(20px, 3.5vw, 44px);
+  font-weight: 700;
+}

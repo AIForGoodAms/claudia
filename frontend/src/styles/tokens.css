@@ -1,0 +1,46 @@
+/*
+ * Design tokens for the AAC board.
+ *
+ * Colors are a Fitzgerald-style palette eyeballed from Yasmin's device
+ * screenshot (home page). Exact hex values are APPROXIMATE and are refined in
+ * Phase 7 against the screenshot. Tile colors are keyed by token name and
+ * referenced from src/data/board.ts via Tile.color.
+ */
+:root {
+  /* Layout */
+  --tile-size: clamp(96px, 14vw, 168px);
+  --tile-gap: clamp(8px, 1.2vw, 16px);
+  --tile-radius: 12px;
+  --board-pad: clamp(8px, 1.5vw, 24px);
+  /* Minimum tile height on the board (symbol tiles); text tiles grow taller. */
+  --tile-min-h: clamp(72px, 11vh, 128px);
+
+  /* Typography (labels are for caregivers/devs, kept small) */
+  --label-size: clamp(11px, 1vw, 15px);
+  --font: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+
+  /* Surfaces */
+  --bg: #f4f4f0;
+  --tile-border: rgba(0, 0, 0, 0.18);
+  --text: #1a1a1a;
+  --text-on-dark: #ffffff;
+
+  /* Category color palette (approximate — see note above) */
+  --tile-white: #ffffff;
+  --tile-red: #e5443b;        /* NEE */
+  --tile-salmon: #f4a69a;     /* people / pink-ish */
+  --tile-pink: #f3b7d4;
+  --tile-yellow: #f6c948;     /* gold */
+  --tile-green: #6fbf73;
+  --tile-brown: #b07d4f;
+  --tile-blue: #5aa9e6;
+  --tile-darkblue: #2f5fa6;
+  --tile-teal: #4fc3b5;
+  --tile-gray: #c9ccd1;
+  --tile-orange: #ef9a4d;
+
+  /* Interaction */
+  --sonar-color: 56, 132, 222;   /* rgb for the sonar ping rings */
+  --record-color: #e5443b;
+  --focus-ring: #2f5fa6;
+}
