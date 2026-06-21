@@ -1,8 +1,8 @@
 # Eye-Gaze AAC Symbol Translator — Design Spec
 
-- **Date:** 2026-06-20
-- **Status:** Approved design, ready for implementation planning
-- **Stack:** Python 3.11 · FastAPI · SQLite · browser front-end
+- **Date:** 2026-06-21
+- **Status:** Revised design (audio-driven input), ready for implementation planning
+- **Stack:** Python 3.11 · FastAPI (WebSocket) · SQLite · browser front-end
 
 ## 1. Problem
 
@@ -11,11 +11,13 @@ a person who cannot speak or move, but who **can hear** and can point with her
 eyes at symbols on a screen. She communicates by selecting from a symbolic
 (pictographic) language.
 
-Composing an utterance symbol-by-symbol with eye-gaze is slow and exhausting.
-Instead, the system **proposes a small set of likely responses** — phrased in
-her voice and rendered as symbol sequences — and she **selects one**. This turns
-expression from authoring into picking, which is far less effort for an
-eye-gaze user.
+A conversation partner speaks to her. The front-end captures that speech as a
+**live audio stream** and sends it to the backend, which transcribes it. From
+the transcript, the system **proposes a small set of likely responses** —
+phrased in her voice and rendered as symbol sequences — and she **selects one**.
+This turns expression from authoring into picking, which is far less effort for
+an eye-gaze user, and removes the typing/dictation step entirely: the partner
+just talks.
 
 Because she can hear, the system never needs to show her incoming speech as
 symbols. Text→symbol translation is therefore **internal plumbing** (it renders
@@ -25,14 +27,20 @@ proposed responses as symbols), not a reading channel for her.
 
 ### Goals (prototype scope)
 
-- Given a context (typed/dictated text, or a photo shown to her), generate N
-  candidate responses in her voice and render each as a symbol sequence.
+- Receive a live audio stream of a conversation partner's speech over a
+  WebSocket and transcribe it on the backend.
+- Detect utterance boundaries (the speaker pausing) on the backend, so each
+  finished utterance triggers a fresh set of options — hands-free.
+- From the transcript, generate N candidate responses in her voice and render
+  each as a symbol sequence.
 - Let her select one option; speak the result aloud (Dutch / English).
 - A semantic-search core that maps natural-language concepts → best symbols.
 - A dictionary seeded from ARASAAC (open-licensed) plus room for custom symbols.
 - Dutch-first, English-supported, via one active-language setting.
 - An abstracted selection-input layer so mouse/dwell works now and real
   eye-tracking drops in later.
+- An abstracted transcriber so cloud Parakeet (OpenRouter) works now and a
+  self-hosted Parakeet drops in later.
 - Personalization: a persona profile and a log of past picks that bias future
   options.
 
@@ -40,20 +48,29 @@ proposed responses as symbols), not a reading channel for her.
 
 - Real eye-tracker or webcam-gaze drivers (only the abstraction is built now).
 - A receptive "read incoming speech as symbols" view (she can hear).
+- Photo/image context and any LLM vision (the input is audio only now).
+- Speaker diarization / separating multiple simultaneous speakers (assume one
+  partner speaks at a time).
+- Live partial-transcript option streaming (we generate options once per
+  finished utterance, not continuously as words arrive).
 - A full grammar engine, multi-user support, auth, or cloud deployment.
 - Model fine-tuning (we personalize via prompt context only).
 - Commercial symbol sets (PCS / Widgit / Bliss).
-- An offline fallback embedder (the interface allows it; we don't build it).
+- Self-hosted ASR and an offline fallback embedder (the interfaces allow both;
+  we don't build them now).
 
 ## 3. Key decisions
 
 | Decision | Choice | Why |
 |---|---|---|
 | Primary interaction | Expressive option-picker | Picking ≪ authoring effort for eye-gaze |
+| Input modality | Live audio stream of the partner's speech | The partner talks; she picks a reply — hands-free context |
+| ASR | NVIDIA Parakeet TDT 0.6b v3 via OpenRouter | Multilingual (EU incl. Dutch), fast, open-weight (self-host later); $0.0015/min |
+| Endpointing | Backend VAD (silero-vad) | Cloud ASR is one-shot; we segment utterances ourselves |
+| Audio transport | WebSocket; 16 kHz mono PCM16 frames | Low-latency push of audio in and options out, one connection |
 | Translation core | Embedding similarity search | Maps meaning → symbols robustly |
 | Embedder | OpenAI `text-embedding-3-small` | Best accuracy for short-phrase nuance; cheap; multilingual |
-| Option generation | Claude (multimodal) | Fluent Dutch; reads photos directly |
-| Image handling | Photo → LLM proposes responses directly | Sidesteps photo-vs-pictograph gap; abstract core words have no photographic form |
+| Option generation | Claude (text-only) | Fluent Dutch; vision no longer needed |
 | Symbol set | ARASAAC (open) + custom | Free, ~13k pictographs, multilingual keywords |
 | Vector store | SQLite (`sqlite-vec`; numpy-blob fallback) | ~13k symbols is trivial; stays in our stack |
 | Language | Dutch primary, English supported | One `lang` setting threads through the stack |
@@ -64,32 +81,38 @@ proposed responses as symbols), not a reading channel for her.
 ## 4. Architecture
 
 One shared semantic-search core serves the expressive loop. All heavy work
-(import, enrich, embed) happens **offline, once**; the live path is fast.
+(import, enrich, embed) happens **offline, once**; the live path is fast. The
+live path is now driven by audio: the browser streams the partner's speech in,
+and the backend pushes symbol options back over the same WebSocket.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│  BROWSER  (her screen)                                                          │
+│  BROWSER  (her screen + room mic)                                              │
 │   ┌────────────────────────────────────────────────────────────────────────┐  │
-│   │  Expressive view: N response options, each a row of large symbol cards   │  │
+│   │  Mic capture (getUserMedia → AudioWorklet → 16 kHz mono PCM16 frames)   │  │
+│   └───────────────────────────────────┬────────────────────────────────────┘  │
+│   ┌───────────────────────────────────┴────────────────────────────────────┐  │
+│   │  Expressive view: N response options, each a row of large symbol cards  │  │
 │   └────────────────────────────────────────────────────────────────────────┘  │
 │                                   ▲ selects one                                 │
 │   ┌───────────────────────────────┴────────────────────────────────────────┐  │
-│   │  SelectionInput (JS)  → onSelect(targetId)                               │  │
-│   │  driver now: mouse / dwell    later: eye-tracker, webcam gaze            │  │
-│   └─────────────────────────────────────────────────────────────────────────┘ │
-└───────────────────────────────────┬────────────────────────────────────────────┘
-                                     │ HTTP / WebSocket (JSON)
-┌────────────────────────────────────┴───────────────────────────────────────────┐
+│   │  SelectionInput (JS)  → onSelect(targetId)                              │  │
+│   │  driver now: mouse / dwell    later: eye-tracker, webcam gaze           │  │
+│   └────────────────────────────────────────────────────────────────────────┘  │
+└───────────────┬───────────────────────────────────────────────▲────────────────┘
+        audio frames (WS)                               options push (WS)
+┌───────────────┴───────────────────────────────────────────────┴────────────────┐
 │  PYTHON BACKEND (FastAPI)                                                        │
-│   POST /expressive/options      POST /expressive/select      POST /translate(dev)│
-│         │                              │                            │            │
-│         ▼                              ▼                            ▼            │
-│  ┌──────────────┐            ┌─────────────────┐           ┌──────────────┐      │
-│  │OptionGenerator│           │UtteranceComposer │          │  (glossify)  │      │
-│  │ (Claude,vision)│          │ pick → text → TTS│          │ text→glosses │      │
-│  └──────┬────────┘           └────────┬─────────┘          └──────┬───────┘      │
-│         │ N × {text, glosses[]}        │                          │              │
-│         ▼                              │                          ▼              │
+│   WS /expressive/listen     POST /expressive/select     POST /translate (dev)    │
+│   POST /expressive/options (dev, audio-free)                                     │
+│         │                                                                        │
+│         ▼                                                                        │
+│  ┌───────────────┐  utterance  ┌──────────────┐  text  ┌─────────────────┐      │
+│  │ AudioSegmenter│────audio───►│  Transcriber │───────►│ OptionGenerator  │     │
+│  │ (VAD endpoint)│             │  (Parakeet)  │        │  (Claude, text)  │     │
+│  └───────────────┘             └──────────────┘        └────────┬─────────┘     │
+│                                              N × {text, glosses[]}│              │
+│                                                                   ▼              │
 │  ┌──────────────────────────────────────────────────────────────────────┐      │
 │  │  Translator.to_symbols(glosses, lang)   — each gloss → best symbol     │      │
 │  └───────────────────────────────┬──────────────────────────────────────┘      │
@@ -103,9 +126,9 @@ One shared semantic-search core serves the expressive loop. All heavy work
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  DATA (SQLite + files)                                                          │
 │   symbols · symbol_terms(label,description,vector,lang) · persona ·            │
-│   interactions · options · settings        media/ (symbol PNGs, input photos)  │
+│   interactions · options · settings   media/ (symbol PNGs, utterance audio)    │
 └──────────────────────────────────────────────────────────────────────────────┘
-   External: Claude API (LLM + vision) · OpenAI embeddings · browser TTS · ARASAAC (import only)
+   External: OpenRouter (Parakeet ASR) · Claude API (text) · OpenAI embeddings · browser TTS · ARASAAC (import only)
 
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  OFFLINE INDEXING PIPELINE (run once / on vocab change — NOT in the live path)  │
@@ -120,18 +143,26 @@ tested on its own.
 
 | Module | Responsibility | Interface |
 |---|---|---|
+| `audio_stream.py` | buffer streamed frames; VAD-detect the end of an utterance | `feed(frame) -> Segment?` (emits one utterance's audio on a silence endpoint) |
+| `transcriber.py` | utterance audio → text (cloud now, local later) | `transcribe(audio, lang) -> Transcript` |
 | `embedder.py` | text → vector (shared by index and query) | `embed(text) -> vec` |
 | `symbol_search.py` | cosine top-k over `symbol_terms` for a language | `search(text, k, lang) -> [Match]` |
 | `translator.py` | glosses → symbol sequence; text → glosses | `to_symbols(glosses, lang)`, `glossify(text, lang)` |
 | `option_generator.py` | LLM candidate responses from context + persona | `generate(context, persona, history, n, lang) -> [Candidate]` |
 | `utterance.py` | chosen option → final text (TTS done in browser) | `compose(option) -> Utterance` |
 | `persona.py` | load persona; load recent history; log interactions | `load()`, `recent(n)`, `log(...)` |
-| `api.py` | FastAPI routes, orchestration | the routes in §7 |
+| `api.py` | FastAPI routes (incl. the WS), orchestration | the routes in §7 |
 | `indexing/` | import ARASAAC · enrich · build embeddings | offline scripts |
 
 A `Candidate` is `{ text: str, glosses: [str] }`. The LLM emits both the natural
 sentence **and** its telegraphic content words in one call, so we never need a
 separate NLP decomposition step — the model already knows AAC-style core words.
+
+A `Transcript` is `{ text: str, lang: str }` — the recognized words plus the
+language (pinned from `settings.lang`, or auto-detected). `audio_stream` and
+`transcriber` split deliberately: one decides *where an utterance ends*, the
+other *what was said*. Either can be swapped (a different VAD, a self-hosted
+Parakeet) without touching the other or the option pipeline.
 
 ## 6. Data model (SQLite)
 
@@ -157,14 +188,15 @@ CREATE TABLE symbol_terms (
   PRIMARY KEY (symbol_id, lang)
 );
 
--- The learning log: one row per context presented to her
+-- The learning log: one row per context (utterance) presented to her
 CREATE TABLE interactions (
-  id                INTEGER PRIMARY KEY,
-  ts                TEXT NOT NULL,
-  lang              TEXT NOT NULL,
-  context_type      TEXT NOT NULL,       -- 'text' | 'image'
-  context_text      TEXT,
-  context_image_path TEXT
+  id                 INTEGER PRIMARY KEY,
+  ts                 TEXT NOT NULL,
+  lang               TEXT NOT NULL,
+  context_type       TEXT NOT NULL,      -- 'audio' (product) | 'text' (dev)
+  context_text       TEXT NOT NULL,      -- the transcript (or dev-supplied text)
+  context_audio_path TEXT,               -- utterance clip under media/, nullable
+  asr_model          TEXT                -- ASR provenance; null for dev 'text'
 );
 
 -- Candidate options generated for an interaction; her pick is the signal
@@ -187,7 +219,10 @@ CREATE TABLE persona (
 
 CREATE TABLE settings (
   key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL                    -- e.g. lang='nl', option_count='5', match_threshold='0.30'
+  value TEXT NOT NULL                    -- lang='nl', option_count='5',
+                                         -- match_threshold='0.30',
+                                         -- vad_silence_ms='800',
+                                         -- asr_model='nvidia/parakeet-tdt-0.6b-v3'
 );
 ```
 
@@ -197,21 +232,32 @@ means re-indexing. Per-language rows let a Dutch query match Dutch descriptions
 directly (strictly more accurate than cross-lingual matching, at negligible
 cost). `settings.lang` is the single source of truth for the active language;
 it selects the ARASAAC locale, which `symbol_terms` rows to search, the language
-Claude writes in, and the TTS voice.
+Parakeet transcribes in, the language Claude writes in, and the TTS voice.
+`vad_silence_ms` is how long a pause counts as the end of an utterance; it is the
+main knob for turn-taking feel.
 
 ## 7. API endpoints
 
-Two user-facing endpoints, plus one dev/curation endpoint. Text→symbol
-translation is otherwise an internal service.
+One user-facing WebSocket (the live audio loop) and one user-facing POST (commit
+and speak), plus two dev/curation endpoints. Text→symbol translation is
+otherwise an internal service.
 
-### `POST /expressive/options` — propose
+### `WS /expressive/listen` — listen and propose (the centerpiece)
 
-- **In:** `{ text?, image?, lang }` — context as text or uploaded photo.
-- **Does:** load persona + recent picks → `OptionGenerator.generate` (Claude;
-  multimodal if image) → for each candidate, `Translator.to_symbols(glosses)` →
-  persist one `interactions` row + N `options` rows.
-- **Out:** `{ interaction_id, options: [ { option_id, text,
-  symbols: [ { id, label, image_url, confidence } ] } ] }`.
+- **Client → server:** binary audio frames (16 kHz mono PCM16, ~20 ms each).
+- **Per connection, the server:** feeds frames to `AudioSegmenter`; on a silence
+  endpoint it takes the buffered utterance audio → `Transcriber.transcribe` →
+  if the transcript is non-empty, load persona + recent picks →
+  `OptionGenerator.generate` (Claude) → for each candidate
+  `Translator.to_symbols(glosses)` → persist one `interactions` row
+  (`context_type='audio'`) + N `options` rows → push the result.
+- **Server → client (JSON events):**
+  - `{ type: 'utterance', interaction_id, transcript,
+      options: [ { option_id, text,
+        symbols: [ { id, label, image_url, confidence } ] } ] }`
+  - `{ type: 'error', code, message }`
+- Selection is a separate call (`POST /expressive/select`); the socket is for
+  the audio-in / options-out loop.
 
 ### `POST /expressive/select` — commit and speak
 
@@ -219,6 +265,16 @@ translation is otherwise an internal service.
 - **Does:** set `options.was_selected = 1` (learning signal) →
   `UtteranceComposer.compose`.
 - **Out:** `{ text, lang }` — the browser speaks it via `SpeechSynthesis`.
+
+### `POST /expressive/options` — dev / test (audio-free)
+
+- **In:** `{ text, lang }` — a transcript supplied directly, no audio.
+- **Does:** the same post-ASR pipeline (`OptionGenerator.generate` →
+  `Translator.to_symbols`); persist `interactions` (`context_type='text'`) + N
+  `options` rows.
+- **Out:** `{ interaction_id, options: [ … ] }` (same shape as the WS event).
+- **Use:** deterministic testing of option generation + symbol mapping without
+  exercising the mic, VAD, or ASR.
 
 ### `POST /translate` — dev / caregiver curation (not her UI)
 
@@ -232,28 +288,45 @@ translation is otherwise an internal service.
 
 **Expressive turn (the centerpiece):**
 
-1. A context appears (a photo shown to her, or something said, typed/dictated).
-2. `/expressive/options` asks Claude for N responses in her voice, grounded in
-   persona + recent picks. Each response carries `{ text, glosses }`.
-3. Each gloss is embedded and matched to its best symbol (top-1 above the
-   confidence threshold). The option becomes a symbol sequence.
-4. The browser shows N rows of large symbol cards.
-5. She selects one via `SelectionInput`.
-6. `/expressive/select` records the pick and returns the final text; the browser
-   speaks it in the active language.
-7. The pick is logged and feeds the next turn's persona context.
+1. A conversation partner speaks near her device.
+2. The browser captures the mic and streams 16 kHz mono PCM16 frames over
+   `WS /expressive/listen`.
+3. `AudioSegmenter` runs VAD; when the speaker pauses (silence ≥
+   `vad_silence_ms`), it closes the utterance and emits its audio.
+4. `Transcriber` sends the utterance audio to Parakeet (OpenRouter) → transcript
+   (Dutch/English per `settings.lang`).
+5. The transcript becomes the context: `OptionGenerator` asks Claude for N
+   responses in her voice, grounded in persona + recent picks. Each response
+   carries `{ text, glosses }`.
+6. Each gloss is embedded and matched to its best symbol (top-1 above the
+   confidence threshold). The option becomes a symbol sequence. One
+   `interactions` row + N `options` rows are persisted.
+7. The backend pushes `{ transcript, options }` over the WS; the browser shows N
+   rows of large symbol cards.
+8. She selects one via `SelectionInput` → `POST /expressive/select` records the
+   pick and returns the final text; the browser speaks it in the active language.
+9. The pick is logged and feeds the next turn's persona context.
 
-**Internal translation** (used inside step 3, and exposed via `/translate` for
+**Internal translation** (used inside step 6, and exposed via `/translate` for
 dev/curation) is the only use of text→symbol mapping.
 
 ## 9. External services
 
-- **Claude (multimodal)** — option generation and reading photos. Also used
-  once, offline, to enrich ARASAAC descriptions.
+- **OpenRouter — Parakeet TDT 0.6b v3** — speech→text on each utterance, behind
+  the `Transcriber` interface. OpenAI-compatible `POST /v1/audio/transcriptions`
+  (audio clip in → text + segment timestamps out), EU-language coverage incl.
+  Dutch, $0.0015/min. A self-hosted Parakeet (NeMo) can replace it later behind
+  the same interface.
+- **Claude (text)** — option generation. Also used once, offline, to enrich
+  ARASAAC descriptions. No vision is used.
 - **OpenAI `text-embedding-3-small`** — embeddings, 1536 dims, behind the
-  `Embedder` interface. Two vendors total (Claude + OpenAI); two API keys.
+  `Embedder` interface.
 - **Browser `SpeechSynthesis`** — TTS (`nl-NL` / `en` voices).
 - **ARASAAC** — pictograph images + multilingual keywords, at import time only.
+
+Three vendors / three keys (OpenRouter + Anthropic + OpenAI). Claude and the
+embedder could later be routed through OpenRouter too, collapsing to one key; we
+keep them direct for now (see §14).
 
 ## 10. Offline indexing pipeline
 
@@ -268,29 +341,40 @@ Run once, and again whenever the vocabulary changes. Not in the live path.
 
 ## 11. Error handling and edge cases
 
+- **Silence / no speech:** VAD never endpoints; nothing is sent. Correct
+  behavior — no utterance, no options.
+- **ASR failure or timeout:** push `{ type: 'error' }`; the UI shows "couldn't
+  hear that" and keeps listening. No options is better than wrong options.
+- **Empty or garbled transcript:** if the transcript is empty or below a minimum
+  length, skip option generation (optionally signal "didn't catch that").
+- **Mis-cut turn (VAD too eager/lax):** tune `vad_silence_ms`; if the partner
+  keeps talking, the next segment simply produces the next set of options.
+  Acceptable for a prototype.
+- **WebSocket drop:** the browser reconnects; any in-flight utterance is
+  discarded. No partial options are shown.
 - **Low-confidence match:** if a gloss's best symbol is below
   `settings.match_threshold`, the card shows the gloss **as text** instead of a
   wrong picture, and is flagged for curation. Never show a confidently-wrong
   symbol.
-- **LLM failure (`/expressive/options`):** return a clear error; the UI offers
-  retry. No options is better than bad options.
-- **Embedding API failure:** the search cannot run; return an error. (A local
+- **Option-generation (LLM) failure:** push an error; the UI keeps listening for
+  the next utterance.
+- **Embedding API failure:** the search cannot run; push an error. (A local
   fallback embedder is a future option behind the same interface.)
-- **Image upload:** validate type/size; store under `media/`; on decode failure,
-  return a clear error.
 - **Stale/unknown selection:** reject `select` for an unknown `interaction_id`
   or `option_id`.
-- **Empty option set:** if the LLM returns nothing usable, surface "no
-  suggestions — try rephrasing the context."
 
 ## 12. Testing strategy
 
-- **Unit:** `embedder` (shape/determinism, mocked API), `symbol_search`
-  (expected top-k on a tiny fixture dictionary), `translator` (glosses →
-  sequence; threshold behavior), `option_generator` (mocked Claude → valid
-  `{text, glosses}`), `utterance` (compose).
-- **Integration:** full expressive pipeline with a fake LLM + small symbol DB:
-  context → options → select → text.
+- **Unit:** `audio_stream` (VAD boundaries on fixture audio with known
+  silences — speech segmented at the right points), `transcriber` (mocked
+  OpenRouter → `Transcript`), `embedder` (shape/determinism, mocked API),
+  `symbol_search` (expected top-k on a tiny fixture dictionary), `translator`
+  (glosses → sequence; threshold behavior), `option_generator` (mocked Claude →
+  valid `{text, glosses}`), `utterance` (compose).
+- **Integration:** fake audio frames → `AudioSegmenter` → fake `Transcriber` →
+  real option pipeline → options. The `POST /expressive/options` dev endpoint
+  drives the same pipeline audio-free for a deterministic check: text → options
+  → select → text.
 - **Retrieval eval (the riskiest piece):** a curated set of
   `query → expected symbol` pairs in `nl` and `en`; measure **recall@k**. This
   is the primary signal for tuning descriptions, the threshold, and `k`. The
@@ -298,25 +382,47 @@ Run once, and again whenever the vocabulary changes. Not in the live path.
 
 ## 13. Tech stack
 
-- Python 3.11, FastAPI + Uvicorn.
+- Python 3.11, FastAPI + Uvicorn, with FastAPI's native WebSocket support for
+  `/expressive/listen`.
+- Backend VAD via `silero-vad` (accurate endpointing; `webrtcvad` is a lighter,
+  torch-free fallback if the dependency weight matters).
+- OpenRouter HTTP client for Parakeet transcription (OpenAI-compatible
+  `/v1/audio/transcriptions`); utterance PCM is wrapped as a WAV per request.
 - SQLite with `sqlite-vec` (numpy brute-force cosine as fallback — ~13k symbols
   is <10 ms either way).
-- OpenAI `text-embedding-3-small` (embeddings); Claude (option generation +
-  vision + offline enrichment).
+- OpenAI `text-embedding-3-small` (embeddings); Claude (text-only option
+  generation + offline enrichment).
 - Front-end: plain HTML/CSS/JS — a grid of large targets, dwell-to-select,
-  browser `SpeechSynthesis` for speech and optional `SpeechRecognition` for
-  dictating the context.
+  browser `SpeechSynthesis` for speech, and `getUserMedia` + an `AudioWorklet`
+  to capture the mic, downsample to 16 kHz mono PCM16, and stream frames over the
+  WebSocket. (Browser `SpeechRecognition` is no longer used; transcription is on
+  the backend.)
 
 ## 14. Open questions and future work
 
+- **VAD library:** `silero-vad` (accurate, pulls torch) vs. `webrtcvad`
+  (lighter, cruder). Default to silero; revisit if the dependency or latency
+  hurts.
+- **Language: pin vs. auto-detect:** Parakeet can auto-detect, but pinning to
+  `settings.lang` is more predictable for a Dutch-first user. Default to pinned;
+  expose auto-detect later if she switches languages mid-conversation.
+- **Vendor consolidation:** routing Claude (and embeddings, if a compatible
+  model exists) through OpenRouter would reduce three keys to one. Deferred;
+  keep direct clients for now.
+- **Persisting utterance audio:** `context_audio_path` lets us replay mis-hears
+  and re-run ASR offline; weigh against storage and privacy before enabling by
+  default.
 - **Option count:** default 5; expose in `settings`. Eye-gaze favours few, large
   targets — tune with the user.
-- **Privacy:** her photos and words are sent to LLM/embedding APIs. Acceptable
-  for a prototype; a real deployment needs a conscious data-handling decision
-  (and is an argument for the local fallback embedder).
+- **Privacy:** the partner's speech (audio + transcript) and her words are sent
+  to OpenRouter / Claude / embedding APIs. Acceptable for a prototype; a real
+  deployment needs a conscious data-handling decision — and is the strongest
+  argument for self-hosting Parakeet and a local fallback embedder.
 - **Multi-symbol per gloss:** v1 maps one gloss → one symbol. Some concepts need
   a small phrase of symbols; revisit if recall@k shows misses.
 - **Real eye-tracking:** add a `SelectionInput` driver (Tobii SDK or webcam/
   MediaPipe) without touching the rest of the stack.
+- **Self-hosted ASR:** swap cloud Parakeet for a local NeMo Parakeet behind the
+  `Transcriber` interface — for privacy, offline use, and cost.
 - **Learning beyond prompt context:** today picks bias the LLM prompt; later we
   could re-rank options or symbols from her history.
