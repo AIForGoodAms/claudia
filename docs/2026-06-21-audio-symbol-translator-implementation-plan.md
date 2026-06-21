@@ -221,7 +221,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 def conn():
     import db        # seeding plan: creates symbols + symbol_terms
     import store     # this plan: creates interactions, options, persona, settings
-    connection = sqlite3.connect(":memory:")
+    connection = sqlite3.connect(":memory:", check_same_thread=False)  # FastAPI TestClient uses a worker thread
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     db.create_schema(connection)
@@ -1692,6 +1692,8 @@ async def listen(ws: WebSocket):
     try:
         while True:
             message = await ws.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
             if message.get("text") is not None:
                 control = json.loads(message["text"])
                 kind = control.get("type")
