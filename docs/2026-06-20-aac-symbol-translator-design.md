@@ -69,7 +69,7 @@ proposed responses as symbols), not a reading channel for her.
 | Endpointing | Backend VAD (silero-vad) | Cloud ASR is one-shot; we segment utterances ourselves |
 | Audio transport | WebSocket; 16 kHz mono PCM16 frames | Low-latency push of audio in and options out, one connection |
 | Translation core | Embedding similarity search | Maps meaning → symbols robustly |
-| Embedder | OpenAI `text-embedding-3-small` | Best accuracy for short-phrase nuance; cheap; multilingual |
+| Embedder | `intfloat/multilingual-e5-large` via OpenRouter | 1024-dim, 90+ languages incl. Dutch; same OpenRouter key as ASR + LLM |
 | Option generation | GLM-5.2 (`z-ai/glm-5.2`) via OpenRouter | Strong multilingual reasoning; text-only; shares the OpenRouter key with ASR |
 | Symbol set | ARASAAC (open) + custom | Free, ~13k pictographs, multilingual keywords |
 | Vector store | SQLite (`sqlite-vec`; numpy-blob fallback) | ~13k symbols is trivial; stays in our stack |
@@ -128,7 +128,7 @@ and the backend pushes symbol options back over the same WebSocket.
 │   symbols · symbol_terms(label,description,vector,lang) · persona ·            │
 │   interactions · options · settings   media/ (symbol PNGs, utterance audio)    │
 └──────────────────────────────────────────────────────────────────────────────┘
-   External: OpenRouter (Parakeet ASR + GLM-5.2 LLM) · OpenAI embeddings · browser TTS · ARASAAC (import only)
+   External: OpenRouter (Parakeet ASR + GLM-5.2 LLM + E5 embeddings) · browser TTS · ARASAAC (import only)
 
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  OFFLINE INDEXING PIPELINE (run once / on vocab change — NOT in the live path)  │
@@ -145,7 +145,7 @@ tested on its own.
 |---|---|---|
 | `audio_stream.py` | buffer streamed frames; VAD-detect the end of an utterance | `feed(frame) -> Segment?` (emits one utterance's audio on a silence endpoint) |
 | `transcriber.py` | utterance audio → text (cloud now, local later) | `transcribe(audio, lang) -> Transcript` |
-| `embedder.py` | text → vector (shared by index and query) | `embed(text) -> vec` |
+| `embedder.py` | text → vector (shared by index and query) | `embed(text, kind) -> vec` (`kind`: `query` \| `passage`) |
 | `symbol_search.py` | cosine top-k over `symbol_terms` for a language | `search(text, k, lang) -> [Match]` |
 | `translator.py` | glosses → symbol sequence; text → glosses | `to_symbols(glosses, lang)`, `glossify(text, lang)` |
 | `option_generator.py` | LLM candidate responses from context + persona | `generate(context, persona, history, n, lang) -> [Candidate]` |
@@ -163,6 +163,11 @@ language (pinned from `settings.lang`, or auto-detected). `audio_stream` and
 `transcriber` split deliberately: one decides *where an utterance ends*, the
 other *what was said*. Either can be swapped (a different VAD, a self-hosted
 Parakeet) without touching the other or the option pipeline.
+
+`embed(text, kind)` carries a `kind` because the E5 embedder expects an
+asymmetric prefix — `query:` on a lookup gloss, `passage:` on a stored symbol
+description. `symbol_search` embeds with `query`; the offline index embeds with
+`passage`. Getting this right materially affects recall.
 
 ## 6. Data model (SQLite)
 
@@ -320,14 +325,14 @@ dev/curation) is the only use of text→symbol mapping.
 - **GLM-5.2 (`z-ai/glm-5.2`)** — text-only option generation, and the offline
   ARASAAC enrichment pass. 1M-token context; $1.20 / $4.10 per 1M tokens;
   OpenAI-compatible chat completions. Shares the OpenRouter key with Parakeet.
-- **OpenAI `text-embedding-3-small`** — embeddings, 1536 dims, behind the
-  `Embedder` interface.
+- **`intfloat/multilingual-e5-large` (via OpenRouter)** — embeddings, 1024 dims,
+  90+ languages, $0.01/M tokens, behind the `Embedder` interface. Expects E5's
+  `query:` / `passage:` input prefixes (see §5).
 - **Browser `SpeechSynthesis`** — TTS (`nl-NL` / `en` voices).
 - **ARASAAC** — pictograph images + multilingual keywords, at import time only.
 
-Two vendors / two keys (OpenRouter for ASR + LLM, OpenAI for embeddings). The
-embedder could later move to OpenRouter too — if a compatible embedding model is
-offered — collapsing to a single key; we keep it direct for now (see §14).
+One external API key: OpenRouter serves ASR, the LLM, and embeddings. The only
+other externals — browser TTS and the one-time ARASAAC import — need no key.
 
 ## 10. Offline indexing pipeline
 
@@ -337,8 +342,8 @@ Run once, and again whenever the vocabulary changes. Not in the live path.
    under `media/`; insert `symbols` rows.
 2. `enrich` — one GLM-5.2 pass per symbol per language: expand the keyword into a
    richer description ("meer, nog een, extra, ik wil nog") for better recall.
-3. `build_index` — embed each `symbol_terms.description`; write `vector` +
-   `model`.
+3. `build_index` — embed each `symbol_terms.description` (E5 `passage:` prefix);
+   write `vector` + `model`.
 
 ## 11. Error handling and edge cases
 
@@ -391,8 +396,9 @@ Run once, and again whenever the vocabulary changes. Not in the live path.
   `/v1/audio/transcriptions`); utterance PCM is wrapped as a WAV per request.
 - SQLite with `sqlite-vec` (numpy brute-force cosine as fallback — ~13k symbols
   is <10 ms either way).
-- OpenAI `text-embedding-3-small` (embeddings); GLM-5.2 via OpenRouter
-  (`z-ai/glm-5.2`, text-only option generation + offline enrichment).
+- `intfloat/multilingual-e5-large` via OpenRouter (embeddings, 1024 dims);
+  GLM-5.2 via OpenRouter (`z-ai/glm-5.2`, text-only option generation + offline
+  enrichment). One OpenRouter client serves ASR, LLM, and embeddings.
 - Front-end: plain HTML/CSS/JS — a grid of large targets, dwell-to-select,
   browser `SpeechSynthesis` for speech, and `getUserMedia` + an `AudioWorklet`
   to capture the mic, downsample to 16 kHz mono PCM16, and stream frames over the
@@ -407,17 +413,13 @@ Run once, and again whenever the vocabulary changes. Not in the live path.
 - **Language: pin vs. auto-detect:** Parakeet can auto-detect, but pinning to
   `settings.lang` is more predictable for a Dutch-first user. Default to pinned;
   expose auto-detect later if she switches languages mid-conversation.
-- **Vendor consolidation:** ASR and the LLM already share the OpenRouter key.
-  Moving embeddings to OpenRouter too — if a compatible embedding model is
-  offered — would collapse to a single key. Deferred; keep the embedder direct
-  on OpenAI for now.
 - **Persisting utterance audio:** `context_audio_path` lets us replay mis-hears
   and re-run ASR offline; weigh against storage and privacy before enabling by
   default.
 - **Option count:** default 5; expose in `settings`. Eye-gaze favours few, large
   targets — tune with the user.
 - **Privacy:** the partner's speech (audio + transcript) and her words are sent
-  to OpenRouter (ASR + LLM) and the OpenAI embedding API. Acceptable for a prototype; a real
+  to OpenRouter (ASR, LLM, and embeddings). Acceptable for a prototype; a real
   deployment needs a conscious data-handling decision — and is the strongest
   argument for self-hosting Parakeet and a local fallback embedder.
 - **Multi-symbol per gloss:** v1 maps one gloss → one symbol. Some concepts need
