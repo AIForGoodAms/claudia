@@ -1,3 +1,4 @@
+import base64
 import httpx
 from claudia import config
 
@@ -21,11 +22,12 @@ async def chat(messages, model, temperature=0.7, response_format=None) -> str:
 
 
 async def transcribe(wav_bytes, model, language=None) -> str:
-    files = {"file": ("utterance.wav", wav_bytes, "audio/wav")}
-    form = {"model": model}
+    # OpenRouter's transcription endpoint takes base64 JSON, not a multipart upload.
+    payload = {"model": model,
+               "input_audio": {"data": base64.b64encode(wav_bytes).decode(), "format": "wav"}}
     if language is not None:
-        form["language"] = language
+        payload["language"] = language
     async with _make_client() as client:
-        response = await client.post("/audio/transcriptions", data=form, files=files)
+        response = await client.post("/audio/transcriptions", json=payload)
         response.raise_for_status()
         return response.json()["text"]

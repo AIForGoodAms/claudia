@@ -1,3 +1,4 @@
+import base64
 import json
 import httpx
 from claudia import openrouter
@@ -19,11 +20,17 @@ async def test_chat_returns_message_content(monkeypatch):
     assert out == "hallo"
 
 
-async def test_transcribe_returns_text(monkeypatch):
+async def test_transcribe_posts_base64_json_and_returns_text(monkeypatch):
     def handler(request):
         assert request.url.path.endswith("/audio/transcriptions")
+        body = json.loads(request.content)              # JSON body, not multipart
+        assert body["model"] == "nvidia/parakeet-tdt-0.6b-v3"
+        assert base64.b64decode(body["input_audio"]["data"]) == b"RIFF...."
+        assert body["input_audio"]["format"] == "wav"
+        assert body["language"] == "nl"
         return httpx.Response(200, json={"text": "goedemorgen"})
 
     monkeypatch.setattr(openrouter, "_make_client", lambda: _client_with(handler))
-    out = await openrouter.transcribe(b"RIFF....", model="nvidia/parakeet-tdt-0.6b-v3")
+    out = await openrouter.transcribe(
+        b"RIFF....", model="nvidia/parakeet-tdt-0.6b-v3", language="nl")
     assert out == "goedemorgen"
