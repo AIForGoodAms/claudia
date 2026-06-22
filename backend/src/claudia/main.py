@@ -1,5 +1,27 @@
+import logging
 import os
 from pathlib import Path
+
+
+def configure_logging(level=logging.INFO):
+    """Send `claudia.*` logs to stderr at INFO.
+
+    uvicorn only configures its own loggers, so without this the app's INFO
+    lines fall back to the WARNING-level last-resort handler and vanish. We put
+    a handler on the `claudia` parent and stop propagation so nothing double-logs
+    through the root/uvicorn handlers.
+    """
+    logger = logging.getLogger("claudia")
+    logger.setLevel(level)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%H:%M:%S"))
+        logger.addHandler(handler)
+    logger.propagate = False
+
+
+configure_logging()
 
 
 def load_env(path=Path(".env")):

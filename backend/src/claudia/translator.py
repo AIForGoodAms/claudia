@@ -46,21 +46,39 @@ def default_symbol_options(conn, lang: str):
                                 confidence=0.0, as_text=True)]]
 
 
+def _card_for(gloss, matches, threshold) -> SymbolCard:
+    best = matches[0] if matches else None
+    if best is not None and best.score >= threshold:
+        return SymbolCard(id=best.symbol_id, label=best.label,
+                          image_url=image_url_for(best.image_path),
+                          confidence=best.score, as_text=False)
+    return SymbolCard(id=(best.symbol_id if best else -1), label=gloss,
+                      image_url=None,
+                      confidence=(best.score if best else 0.0), as_text=True)
+
+
+async def to_symbols_batch(conn, gloss_lists, lang, threshold) -> list[list[SymbolCard]]:
+    """Resolve symbol cards for several gloss lists in one embedding round-trip.
+
+    Flattens every gloss across the lists into a single batched search, then
+    re-splits the cards back into one list per input — so a whole board costs
+    one remote call instead of one per gloss.
+    """
+    flat = [gloss for glosses in gloss_lists for gloss in glosses]
+    if not flat:
+        return [[] for _ in gloss_lists]
+    matches = await symbol_search.search_many(conn, flat, k=1, lang=lang)
+    cards = [_card_for(gloss, m, threshold) for gloss, m in zip(flat, matches)]
+
+    out, start = [], 0
+    for glosses in gloss_lists:
+        out.append(cards[start:start + len(glosses)])
+        start += len(glosses)
+    return out
+
+
 async def to_symbols(conn, glosses, lang, threshold) -> list[SymbolCard]:
-    cards = []
-    for gloss in glosses:
-        matches = await symbol_search.search(conn, gloss, k=1, lang=lang)
-        best = matches[0] if matches else None
-        if best is not None and best.score >= threshold:
-            cards.append(SymbolCard(id=best.symbol_id, label=best.label,
-                                    image_url=image_url_for(best.image_path),
-                                    confidence=best.score, as_text=False))
-        else:
-            cards.append(SymbolCard(id=(best.symbol_id if best else -1), label=gloss,
-                                    image_url=None,
-                                    confidence=(best.score if best else 0.0),
-                                    as_text=True))
-    return cards
+    return (await to_symbols_batch(conn, [glosses], lang, threshold))[0]
 
 
 async def glossify(text: str, lang: str) -> list[str]:

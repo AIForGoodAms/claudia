@@ -1,4 +1,5 @@
 import json
+import logging
 import sqlite3
 from collections import deque
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -19,6 +20,8 @@ from claudia.vad import SileroVad
 from claudia.models import Option
 
 app = FastAPI()
+
+log = logging.getLogger("claudia.api")
 
 # Allow the local Vite dev server (different origin) to call the REST endpoints.
 app.add_middleware(
@@ -63,15 +66,18 @@ async def propose(conn, *, context_text, lang, context_type,
     history = persona.recent(conn, n=5)
     n = int(store.get_setting(conn, "option_count"))
     threshold = float(store.get_setting(conn, "match_threshold"))
+    log.info("propose: generating %d options (LLM=%s)", n, config.MODEL_LLM)
     candidates = await option_generator.generate(context_text, who, history, n, lang)
+    log.info("propose: %d candidates generated, matching symbols", len(candidates))
 
-    texts, card_lists = [], []
-    for candidate in candidates:
-        texts.append(candidate.text)
-        card_lists.append(await translator.to_symbols(conn, candidate.glosses, lang, threshold))
+    texts = [candidate.text for candidate in candidates]
+    card_lists = await translator.to_symbols_batch(
+        conn, [candidate.glosses for candidate in candidates], lang, threshold)
+    log.info("propose: symbols matched for %d options", len(card_lists))
 
     # Similarity search found nothing usable → fall back to the common core board.
     if not _has_matched_symbol(card_lists):
+        log.info("propose: no symbol matched, falling back to core board")
         texts, card_lists = translator.default_symbol_options(conn, lang)
 
     interaction_id = persona.log_interaction(
@@ -123,17 +129,25 @@ async def listen(ws: WebSocket):
     lang = store.get_setting(conn, "lang")
     silence_ms = int(store.get_setting(conn, "vad_silence_ms"))
     segmenter = Segmenter(SileroVad(min_silence_ms=silence_ms))
+    log.info("listen: connected (lang=%s, vad_silence_ms=%s)", lang, silence_ms)
 
     pending_options = deque()      # proposed option-sets awaiting their turn
     awaiting_selection = False     # is an option-set currently shown to her?
+    audio_paused = False           # True while user views options; no new frames processed
     muted = False
+    frames = 0                     # audio frames received this connection
+    received_bytes = 0
 
     async def release_next() -> None:
-        nonlocal awaiting_selection
+        nonlocal awaiting_selection, audio_paused
         if awaiting_selection or not pending_options:
             return
         result = pending_options.popleft()
         awaiting_selection = True
+        audio_paused = True
+        segmenter.reset()
+        log.info("listen: → utterance interaction_id=%s (%d options)",
+                 result["interaction_id"], len(result["options"]))
         await ws.send_json({
             "type": "utterance",
             "interaction_id": result["interaction_id"],
@@ -149,6 +163,7 @@ async def listen(ws: WebSocket):
             if message.get("text") is not None:
                 control = json.loads(message["text"])
                 kind = control.get("type")
+                log.info("listen: control %r", kind)
                 if kind == "mute":
                     muted = True
                     segmenter.reset()
@@ -162,30 +177,54 @@ async def listen(ws: WebSocket):
                         await ws.send_json({"type": "error", "detail": "unknown selection"})
                         continue
                     spoken = utterance.compose(text, lang)
+                    # Unblock audio before releasing next (release_next may re-pause it).
+                    audio_paused = False
+                    awaiting_selection = False
                     await ws.send_json({"type": "speak", "text": spoken.text,
                                         "lang": spoken.lang})
-                    awaiting_selection = False
-                    await release_next()      # her selection releases the next queued set
+                    await release_next()      # pops oldest queued set; re-pauses if one exists
                 continue
 
             frame = message.get("bytes")
-            if frame is None or muted:
+            if frame is None:
+                # Neither text nor bytes — a stray/keepalive frame. Surface it so a
+                # client sending the wrong shape (e.g. base64 text) is visible.
+                log.warning("listen: message with no text or bytes: keys=%s", list(message))
+                continue
+            frames += 1
+            received_bytes += len(frame)
+            if frames == 1:
+                log.info("listen: first audio frame (%d bytes)", len(frame))
+            elif frames % 100 == 0:
+                log.info("listen: %d frames / %d bytes received", frames, received_bytes)
+            if muted or audio_paused:
                 continue
             segment = segmenter.feed(frame)
             if segment is None:
                 continue
+            seconds = len(segment.pcm) / 2 / segment.sample_rate
+            log.info("listen: segment %d bytes (%.2fs) → transcribing", len(segment.pcm), seconds)
             transcript = await transcriber.transcribe(segment.pcm, lang)
             if not transcript.text.strip():
+                log.info("listen: empty transcript, skipping")
                 continue
+            log.info("listen: transcript %r", transcript.text)
             result = await propose(conn, context_text=transcript.text, lang=lang,
                                    context_type="audio", asr_model=config.MODEL_ASR)
             result["transcript"] = transcript.text
             pending_options.append(result)
+            log.info("listen: proposed %d options (interaction_id=%s), %d queued",
+                     len(result["options"]), result["interaction_id"], len(pending_options))
             await release_next()              # sends now only if nothing is awaiting selection
     except WebSocketDisconnect:
-        return
+        pass
+    except Exception:
+        # Without this, a failure in transcribe/propose closes the socket with no
+        # trace — the "backend stopped receiving" symptom. Log it loudly.
+        log.exception("listen: error in receive loop")
     finally:
         conn.close()
+        log.info("listen: closed (%d frames, %d bytes received)", frames, received_bytes)
 
 
 config.MEDIA_DIR.mkdir(exist_ok=True)

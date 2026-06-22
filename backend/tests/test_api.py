@@ -14,12 +14,13 @@ def client(conn, monkeypatch):
         return [Candidate(text="ja graag", glosses=["ja"]),
                 Candidate(text="nee", glosses=["nee"])]
 
-    async def fake_to_symbols(connection, glosses, lang, threshold):
-        return [SymbolCard(id=1, label=g, image_url=f"/media/{g}.png",
-                           confidence=0.9, as_text=False) for g in glosses]
+    async def fake_to_symbols_batch(connection, gloss_lists, lang, threshold):
+        return [[SymbolCard(id=1, label=g, image_url=f"/media/{g}.png",
+                            confidence=0.9, as_text=False) for g in glosses]
+                for glosses in gloss_lists]
 
     monkeypatch.setattr(option_generator, "generate", fake_generate)
-    monkeypatch.setattr(translator, "to_symbols", fake_to_symbols)
+    monkeypatch.setattr(translator, "to_symbols_batch", fake_to_symbols_batch)
     return TestClient(api.app)
 
 
@@ -56,12 +57,12 @@ def test_options_fall_back_to_defaults_when_no_symbols(conn, monkeypatch):
     async def fake_generate(context, persona, history, n, lang):
         return [Candidate(text="iets", glosses=["onbekend"])]
 
-    async def fake_to_symbols(connection, glosses, lang, threshold):    # nothing matches
-        return [SymbolCard(id=-1, label=g, image_url=None, confidence=0.0, as_text=True)
-                for g in glosses]
+    async def fake_to_symbols_batch(connection, gloss_lists, lang, threshold):  # nothing matches
+        return [[SymbolCard(id=-1, label=g, image_url=None, confidence=0.0, as_text=True)
+                 for g in glosses] for glosses in gloss_lists]
 
     monkeypatch.setattr(option_generator, "generate", fake_generate)
-    monkeypatch.setattr(translator, "to_symbols", fake_to_symbols)
+    monkeypatch.setattr(translator, "to_symbols_batch", fake_to_symbols_batch)
     res = TestClient(api.app).post("/expressive/options", json={"text": "?", "lang": "nl"})
     body = res.json()
     assert body["options"][0]["text"] == "ik begrijp het niet"

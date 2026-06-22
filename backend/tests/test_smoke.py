@@ -16,7 +16,7 @@ def test_live_seed_two_words(tmp_path):
     with httpx.Client(timeout=60) as client:
         for word in ("water", "eten"):
             status = seed.seed_one(conn, word, tmp_path, client=client,
-                                   embed_fn=embedder.embed, now="t0")
+                                   embed_fn=embedder.embed_sync, now="t0")
             assert status == "seeded"
     rows = conn.execute(
         "SELECT length(vector) FROM symbol_terms").fetchall()

@@ -1,11 +1,9 @@
 # embedder.py
-import os
-import httpx
+from claudia import openrouter
 
 MODEL_ID = "intfloat/multilingual-e5-large"
 DIMS = 1024
 MODEL_TAG = f"{MODEL_ID}@{DIMS}"
-BASE_URL = "https://openrouter.ai/api/v1"
 
 
 def _prefix(kind):
@@ -14,24 +12,16 @@ def _prefix(kind):
     return f"{kind}: "
 
 
-def embed(texts, kind, *, client=None):
+async def embed(texts, kind):
     inputs = [_prefix(kind) + t for t in texts]
-    owns_client = client is None
-    if owns_client:
-        key = os.environ["OPENROUTER_API_KEY"]
-        client = httpx.Client(
-            base_url=BASE_URL,
-            headers={"Authorization": f"Bearer {key}"},
-            timeout=60,
-        )
-    try:
-        response = client.post("/embeddings", json={"model": MODEL_ID, "input": inputs})
-        response.raise_for_status()
-        vectors = [row["embedding"] for row in response.json()["data"]]
-    finally:
-        if owns_client:
-            client.close()
+    vectors = await openrouter.embeddings(inputs, MODEL_ID)
     for vector in vectors:
         if len(vector) != DIMS:
             raise ValueError(f"expected {DIMS}-d vector, got {len(vector)}")
     return vectors
+
+
+def embed_sync(texts, kind):
+    """For offline scripts (seeding) that aren't running an event loop."""
+    import asyncio
+    return asyncio.run(embed(texts, kind))

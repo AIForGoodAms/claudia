@@ -5,20 +5,22 @@ from claudia.models import Match
 
 
 async def test_to_symbols_picks_best_above_threshold(conn, monkeypatch):
-    async def fake_search(connection, text, k, lang):
-        return [Match(symbol_id=7, label=text, image_path=f"media/{text}.png", score=0.8)]
+    async def fake_search_many(connection, texts, k, lang):
+        return [[Match(symbol_id=7, label=t, image_path=f"media/{t}.png", score=0.8)]
+                for t in texts]
 
-    monkeypatch.setattr(symbol_search, "search", fake_search)
+    monkeypatch.setattr(symbol_search, "search_many", fake_search_many)
     cards = await translator.to_symbols(conn, ["koffie"], lang="nl", threshold=0.3)
     assert cards[0].id == 7 and cards[0].as_text is False
     assert cards[0].image_url == "/media/koffie.png"
 
 
 async def test_to_symbols_below_threshold_renders_text(conn, monkeypatch):
-    async def fake_search(connection, text, k, lang):
-        return [Match(symbol_id=7, label="koffie", image_path="media/koffie.png", score=0.1)]
+    async def fake_search_many(connection, texts, k, lang):
+        return [[Match(symbol_id=7, label="koffie", image_path="media/koffie.png", score=0.1)]
+                for _ in texts]
 
-    monkeypatch.setattr(symbol_search, "search", fake_search)
+    monkeypatch.setattr(symbol_search, "search_many", fake_search_many)
     cards = await translator.to_symbols(conn, ["koffie"], lang="nl", threshold=0.3)
     assert cards[0].as_text is True and cards[0].image_url is None
     assert cards[0].label == "koffie"

@@ -41,13 +41,14 @@ def client(conn, monkeypatch):
     async def fake_generate(context, persona, history, n, lang):
         return [Candidate(text="ja graag", glosses=["ja"])]
 
-    async def fake_to_symbols(connection, glosses, lang, threshold):
-        return [SymbolCard(id=1, label=g, image_url=f"/media/{g}.png",
-                           confidence=0.9) for g in glosses]
+    async def fake_to_symbols_batch(connection, gloss_lists, lang, threshold):
+        return [[SymbolCard(id=1, label=g, image_url=f"/media/{g}.png",
+                            confidence=0.9) for g in glosses]
+                for glosses in gloss_lists]
 
     monkeypatch.setattr(transcriber, "transcribe", fake_transcribe)
     monkeypatch.setattr(option_generator, "generate", fake_generate)
-    monkeypatch.setattr(translator, "to_symbols", fake_to_symbols)
+    monkeypatch.setattr(translator, "to_symbols_batch", fake_to_symbols_batch)
     return TestClient(api.app)
 
 

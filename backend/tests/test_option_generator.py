@@ -1,6 +1,7 @@
 import json
 from claudia import option_generator
 from claudia import openrouter
+from claudia import config
 from claudia.models import Persona, Pick
 
 
@@ -22,7 +23,7 @@ async def test_generate_parses_candidates(monkeypatch):
         history=[Pick(context_text="hoe gaat het?", selected_text="goed")],
         n=2, lang="nl")
 
-    assert captured["model"] == "z-ai/glm-5.2"
+    assert captured["model"] == config.MODEL_LLM
     assert [c.text for c in out] == ["ja graag", "nee dank je"]
     assert out[0].glosses == ["ja", "graag"]
     prompt = " ".join(m["content"] for m in captured["messages"])

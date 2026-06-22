@@ -23,6 +23,13 @@ async def chat(messages, model, temperature=0.7, response_format=None) -> str:
         return response.json()["choices"][0]["message"]["content"]
 
 
+async def embeddings(inputs, model) -> list[list[float]]:
+    async with _make_client() as client:
+        response = await client.post("/embeddings", json={"model": model, "input": inputs})
+        response.raise_for_status()
+        return [row["embedding"] for row in response.json()["data"]]
+
+
 async def transcribe(wav_bytes, model, language=None) -> str:
     # OpenRouter's transcription endpoint takes base64 JSON, not a multipart upload.
     payload = {"model": model,

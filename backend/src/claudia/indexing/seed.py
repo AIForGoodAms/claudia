@@ -79,7 +79,7 @@ def main(argv=None):
     with httpx.Client(timeout=60) as client:
         for word in load_words(args.words_path):
             status = seed_one(conn, word, args.media_dir, client=client,
-                              embed_fn=embedder.embed, now=now)
+                              embed_fn=embedder.embed_sync, now=now)
             counts[status] += 1
             if status == "unresolved":
                 unresolved.append(word)

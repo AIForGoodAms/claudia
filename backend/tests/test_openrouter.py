@@ -20,6 +20,21 @@ async def test_chat_returns_message_content(monkeypatch):
     assert out == "hallo"
 
 
+async def test_embeddings_posts_input_and_returns_vectors_in_order(monkeypatch):
+    def handler(request):
+        assert request.url.path.endswith("/embeddings")
+        body = json.loads(request.content)
+        assert body["model"] == "intfloat/multilingual-e5-large"
+        assert body["input"] == ["passage: a", "passage: b"]
+        return httpx.Response(200, json={"data": [
+            {"embedding": [0.0]}, {"embedding": [1.0]}]})
+
+    monkeypatch.setattr(openrouter, "_make_client", lambda: _client_with(handler))
+    out = await openrouter.embeddings(
+        ["passage: a", "passage: b"], model="intfloat/multilingual-e5-large")
+    assert out == [[0.0], [1.0]]
+
+
 async def test_transcribe_posts_base64_json_and_returns_text(monkeypatch):
     def handler(request):
         assert request.url.path.endswith("/audio/transcriptions")

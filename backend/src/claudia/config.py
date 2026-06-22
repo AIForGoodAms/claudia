@@ -5,7 +5,10 @@ OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 MODEL_ASR = "nvidia/parakeet-tdt-0.6b-v3"
-MODEL_LLM = "z-ai/glm-5.2"
+# :nitro routes to the highest-throughput provider (Groq/Cerebras). gpt-oss-120b
+# there returns the option board in ~0.7s vs ~8s for glm-5.2, with Dutch glosses
+# intact — flash-lite was as fast but emitted English glosses, breaking lookup.
+MODEL_LLM = os.environ.get("MODEL_LLM", "openai/gpt-oss-120b:nitro")
 # Embedding model id/dims live in the seeding plan's embedder.py (MODEL_ID, DIMS).
 
 DB_PATH = Path(os.environ.get("AAC_DB_PATH", "symbols.db"))   # same default as seeding seed.py

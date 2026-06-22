@@ -59,7 +59,13 @@ function hasMediaSupport(): boolean {
 export function startCapture({ onFrame, onError }: StartCaptureOptions = {}): AudioCapture {
   const AudioCtx = getAudioContextCtor();
   if (!hasMediaSupport() || !AudioCtx) {
-    const err = new Error('Microphone capture is not supported in this browser.');
+    // getUserMedia needs a secure context: it's undefined over http on a non-
+    // localhost host (e.g. the tablet at http://192.168.x.x). Serve over https
+    // or localhost. We can't tell that apart from a truly old browser, so name
+    // both causes.
+    const err = new Error(
+      'Microphone capture unavailable — needs a secure context (https or localhost) and a supporting browser.',
+    );
     console.warn('[audio]', err.message);
     onError?.(err);
     return { stop: () => {}, mute: () => {}, unmute: () => {} };
@@ -124,6 +130,10 @@ export function startCapture({ onFrame, onError }: StartCaptureOptions = {}): Au
       processor.onaudioprocess = handleAudio;
       source.connect(processor);
       processor.connect(context.destination);
+      // Autoplay policy can start the context suspended, which never fires
+      // onaudioprocess — so no frames reach the backend. resume() is a no-op
+      // when already running.
+      void context.resume();
     })
     .catch((err: unknown) => {
       const error = err instanceof Error ? err : new Error(String(err));

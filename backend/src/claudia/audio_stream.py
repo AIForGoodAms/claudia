@@ -1,4 +1,8 @@
+import logging
+
 from claudia.models import Segment
+
+log = logging.getLogger("claudia.audio")
 
 WINDOW_SAMPLES = 512                          # the window size silero-vad needs at 16 kHz
 WINDOW_BYTES = WINDOW_SAMPLES * 2             # PCM16: 2 bytes per sample
@@ -30,8 +34,10 @@ class Segmenter:
             if event and "start" in event:
                 self._in_speech = True
                 self._speech = [window]
+                log.info("vad: speech start")
             elif event and "end" in event and self._in_speech:
                 self._speech.append(window)
+                log.info("vad: speech end (%d windows)", len(self._speech))
                 segment = Segment(pcm=b"".join(self._speech), sample_rate=self._sample_rate)
                 self._in_speech = False
                 self._speech = []
