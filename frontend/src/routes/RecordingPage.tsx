@@ -102,7 +102,10 @@ export default function RecordingPage() {
     transport.onOptions((r) => replaceOptions(r.interaction_id, r.options));
     transport.onError((e) => console.warn('[transport]', e.message));
 
-    void transport.start({ lang });
+    // A rejected connect surfaces here rather than as an unhandled rejection.
+    transport.start({ lang }).catch((e: unknown) => {
+      console.warn('[transport] failed to start', e);
+    });
 
     captureRef.current = startCapture({
       onFrame: (frame) => transportRef.current?.sendFrame(frame),

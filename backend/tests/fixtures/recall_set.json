@@ -1,0 +1,5 @@
+[
+  {"lang": "nl", "query": "ik wil koffie", "expected_label": "koffie"},
+  {"lang": "nl", "query": "nog een keer", "expected_label": "meer"},
+  {"lang": "en", "query": "i want coffee", "expected_label": "coffee"}
+]

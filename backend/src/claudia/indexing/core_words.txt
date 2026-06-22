@@ -1,0 +1,226 @@
+# Curated Dutch AAC core- and fringe-vocabulary seed list.
+# One communicative unit per line. Blank lines and lines starting
+# with '#' are ignored. Mixes single core words with short social
+# phrases and self-introduction sentences.
+
+# --- pronouns & people ---
+ik
+jij
+hij
+zij
+wij
+jullie
+mama
+papa
+oma
+opa
+broer
+zus
+vriend
+juf
+meester
+dokter
+
+# --- core verbs ---
+willen
+hebben
+zijn
+gaan
+komen
+maken
+doen
+eten
+drinken
+helpen
+stoppen
+kijken
+voelen
+zeggen
+horen
+zien
+geven
+pakken
+spelen
+slapen
+lopen
+zitten
+staan
+zoeken
+vinden
+weten
+denken
+houden
+wachten
+lezen
+schrijven
+tekenen
+zingen
+dansen
+
+# --- requests & polite ---
+meer
+minder
+weer
+nog
+klaar
+genoeg
+alsjeblieft
+dank je wel
+ja
+nee
+misschien
+stop
+help
+wacht
+
+# --- feelings & states ---
+blij
+verdrietig
+boos
+bang
+moe
+pijn
+ziek
+honger
+dorst
+trots
+verlegen
+rustig
+zenuwachtig
+
+# --- describing ---
+groot
+klein
+warm
+koud
+mooi
+lelijk
+leuk
+saai
+snel
+langzaam
+veel
+weinig
+goed
+slecht
+schoon
+vies
+vol
+leeg
+oud
+nieuw
+niet
+
+# --- colours ---
+rood
+blauw
+geel
+groen
+zwart
+wit
+oranje
+roze
+paars
+bruin
+
+# --- time & place ---
+nu
+straks
+later
+vandaag
+morgen
+gisteren
+altijd
+nooit
+soms
+hier
+daar
+thuis
+buiten
+binnen
+boven
+onder
+links
+rechts
+
+# --- food & drink ---
+brood
+appel
+banaan
+water
+melk
+koek
+snoep
+soep
+kaas
+pasta
+
+# --- everyday objects ---
+boek
+bal
+auto
+fiets
+telefoon
+tablet
+jas
+schoenen
+bed
+stoel
+tafel
+deur
+raam
+
+# --- question words ---
+wie
+wat
+waar
+wanneer
+waarom
+hoe
+welke
+
+# --- social phrases ---
+hallo
+hoi
+dag
+goedemorgen
+goedemiddag
+goedenavond
+welterusten
+tot ziens
+tot straks
+hoe gaat het met je?
+het gaat goed
+het gaat niet zo goed
+fijn je te zien
+sorry
+geen probleem
+gefeliciteerd
+veel plezier
+let op
+kijk eens
+wat is dat?
+ik weet het niet
+ik snap het niet
+mag ik naar de wc?
+ik heb hulp nodig
+laat me met rust
+ik wil even alleen zijn
+kun je me helpen?
+wil je met me spelen?
+mag ik dat ook?
+ik ben aan de beurt
+
+# --- self-introduction (elaborate units) ---
+mijn naam is
+ik ben blij je te ontmoeten
+ik woon in
+ik hou van muziek
+ik ben jarig
+hoe heet jij?
+ik ga naar school
+ik heb een broer
+ik heb een zus
+mijn lievelingskleur is blauw
+ik vind voetbal leuk
+dit is mijn vriend
